@@ -888,6 +888,40 @@ mod tests {
         Err("timed out waiting for matching event".to_string())
     }
 
+    #[test]
+    fn subscribe_limit_zero_streams_future_events() {
+        let db = TestDatabase::new();
+        let keys = Keys::generate();
+
+        let snapshot_event = EventBuilder::text_note("snapshot")
+            .sign_with_keys(&keys)
+            .expect("failed to build snapshot event");
+        db.insert(&snapshot_event);
+
+        let filters = vec![Filter::new().limit(0)];
+        let mut subscription = db.subscribe(&filters);
+
+        match subscription.try_next() {
+            Some(StreamItem::Eose) => {}
+            other => panic!("expected EOSE, got {:?}", other),
+        }
+
+        match subscription.try_next() {
+            None => {}
+            Some(item) => panic!("unexpected snapshot item: {:?}", item),
+        }
+
+        let future_event = EventBuilder::text_note("future")
+            .sign_with_keys(&keys)
+            .expect("failed to build future event");
+        db.insert(&future_event);
+
+        match wait_for_event(&mut subscription, 1000) {
+            Ok(json) => assert_eq!(json, future_event.as_json()),
+            Err(err) => panic!("{}", err),
+        }
+    }
+
     /// Test helper for search queries after EOSE
     fn test_search_after_eose(search_query: &str, content: &str) {
         let db = TestDatabase::new();

@@ -156,9 +156,6 @@ impl SearchnosDB {
         note: &NdbNote<'_>,
         normalized_content: &[u8],
     ) -> bool {
-        if matches!(filter.limit, Some(0)) {
-            return false;
-        }
         if filter
             .search
             .as_ref()
