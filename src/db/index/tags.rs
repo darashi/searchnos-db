@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
-use lmdb_sys::{MDB_GET_CURRENT, MDB_NEXT, MDB_SET_RANGE};
+use lmdb_sys::{MDB_GET_CURRENT, MDB_LAST_DUP, MDB_PREV_DUP, MDB_SET_KEY};
 
 use super::common::{decode_created_at_seq_value, delete_dup_value, put_no_dup};
 use crate::db::{AUTHOR_INDEX_VALUE_BYTES, SEQ_BYTES, SearchnosDBError};
@@ -81,10 +82,10 @@ impl TagIndex {
             return Ok(Vec::new().into_iter());
         }
 
-        let mut combined: Option<HashSet<[u8; SEQ_BYTES]>> = None;
+        let mut combined: Option<HashMap<[u8; SEQ_BYTES], u64>> = None;
 
         for (tag, values) in entries {
-            let mut tag_candidates = HashSet::new();
+            let mut tag_candidates = HashMap::new();
 
             for value in values {
                 if value.is_empty() {
@@ -93,11 +94,8 @@ impl TagIndex {
                 let Some(tag_key) = Self::key(*tag, value) else {
                     continue;
                 };
-                let candidates = self.candidates_for_key(txn, &tag_key)?;
-                if tag_candidates.is_empty() {
-                    tag_candidates = candidates;
-                } else {
-                    tag_candidates.extend(candidates.into_iter());
+                for (created_at, seq_bytes) in self.entries_for_key(txn, &tag_key)? {
+                    tag_candidates.entry(seq_bytes).or_insert(created_at);
                 }
             }
 
@@ -108,53 +106,74 @@ impl TagIndex {
             combined = Some(match combined.take() {
                 None => tag_candidates,
                 Some(mut existing) => {
-                    existing.retain(|seq| tag_candidates.contains(seq));
+                    existing.retain(|seq, created_at| {
+                        if let Some(new_created) = tag_candidates.get(seq) {
+                            *created_at = *new_created;
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     existing
                 }
             });
 
-            if combined.as_ref().is_some_and(|set| set.is_empty()) {
+            if combined.as_ref().is_some_and(|map| map.is_empty()) {
                 return Ok(Vec::new().into_iter());
             }
         }
 
-        let candidates: Vec<[u8; SEQ_BYTES]> = combined.unwrap_or_default().into_iter().collect();
+        let mut ordered: Vec<(u64, [u8; SEQ_BYTES])> = combined
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(seq, created_at)| (created_at, seq))
+            .collect();
+
+        ordered.sort_unstable_by(|a, b| match b.0.cmp(&a.0) {
+            Ordering::Equal => b.1.cmp(&a.1),
+            other => other,
+        });
+
+        let candidates: Vec<[u8; SEQ_BYTES]> = ordered.into_iter().map(|(_, seq)| seq).collect();
         Ok(candidates.into_iter())
     }
 
-    fn candidates_for_key<'env>(
+    fn entries_for_key<'env>(
         &self,
         txn: &'env RoTransaction<'env>,
         key: &[u8],
-    ) -> Result<HashSet<[u8; SEQ_BYTES]>, SearchnosDBError> {
+    ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError> {
         let cursor = txn.open_ro_cursor(self.db)?;
-        let mut candidates = HashSet::new();
-
-        match cursor.get(Some(key), None, MDB_SET_RANGE) {
-            Ok(_) => loop {
-                let (key_bytes, value_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
-                    Ok((Some(key), value)) => (key, value),
-                    Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                };
-
-                if key_bytes != key {
-                    break;
-                }
-
-                let (_, seq_bytes) = decode_created_at_seq_value(value_bytes)?;
-                candidates.insert(seq_bytes);
-
-                match cursor.get(None, None, MDB_NEXT) {
-                    Ok(_) => continue,
-                    Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            },
-            Err(lmdb::Error::NotFound) => {}
-            Err(err) => return Err(err.into()),
+        if cursor.get(Some(key), None, MDB_SET_KEY).is_err() {
+            return Ok(Vec::new());
+        }
+        if cursor.get(None, None, MDB_LAST_DUP).is_err() {
+            return Ok(Vec::new());
         }
 
-        Ok(candidates)
+        let mut entries = Vec::new();
+        loop {
+            let value_bytes = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(current_key), value)) => {
+                    if current_key != key {
+                        break;
+                    }
+                    value
+                }
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            };
+
+            let (created_at, seq_bytes) = decode_created_at_seq_value(value_bytes)?;
+            entries.push((created_at, seq_bytes));
+
+            match cursor.get(None, None, MDB_PREV_DUP) {
+                Ok(_) => continue,
+                Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(entries)
     }
 }

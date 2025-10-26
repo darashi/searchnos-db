@@ -95,17 +95,17 @@ impl PubkeyKindIndex {
 
                 match cursor.get(Some(&combination_key), None, MDB_SET_KEY) {
                     Ok(_) => match cursor.get(None, None, MDB_LAST_DUP) {
-                    Ok(_) => loop {
-                        let value_bytes = match cursor.get(None, None, MDB_GET_CURRENT) {
-                            Ok((Some(key), value)) => {
-                                if key != combination_key.as_slice() {
-                                    break;
+                        Ok(_) => loop {
+                            let value_bytes = match cursor.get(None, None, MDB_GET_CURRENT) {
+                                Ok((Some(key), value)) => {
+                                    if key != combination_key.as_slice() {
+                                        break;
+                                    }
+                                    value
                                 }
-                                value
-                            }
-                            Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
-                            Err(err) => return Err(err.into()),
-                        };
+                                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                                Err(err) => return Err(err.into()),
+                            };
 
                             let (indexed_created_at, seq_bytes) = Self::decode_value(value_bytes)?;
 

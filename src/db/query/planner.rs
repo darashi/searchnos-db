@@ -45,6 +45,7 @@ impl PlanSource {
                 | PlanSource::Kinds { .. }
                 | PlanSource::Authors { .. }
                 | PlanSource::PubkeyKinds { .. }
+                | PlanSource::Tags { .. }
         )
     }
 }
