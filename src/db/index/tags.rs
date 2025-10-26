@@ -77,6 +77,8 @@ impl TagIndex {
         &self,
         txn: &'env RoTransaction<'env>,
         entries: &[(char, Vec<String>)],
+        since: Option<u64>,
+        until: Option<u64>,
     ) -> Result<impl Iterator<Item = [u8; SEQ_BYTES]> + 'env, SearchnosDBError> {
         if entries.is_empty() {
             return Ok(Vec::new().into_iter());
@@ -94,7 +96,7 @@ impl TagIndex {
                 let Some(tag_key) = Self::key(*tag, value) else {
                     continue;
                 };
-                for (created_at, seq_bytes) in self.entries_for_key(txn, &tag_key)? {
+                for (created_at, seq_bytes) in self.entries_for_key(txn, &tag_key, since, until)? {
                     tag_candidates.entry(seq_bytes).or_insert(created_at);
                 }
             }
@@ -142,6 +144,8 @@ impl TagIndex {
         &self,
         txn: &'env RoTransaction<'env>,
         key: &[u8],
+        since: Option<u64>,
+        until: Option<u64>,
     ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError> {
         let cursor = txn.open_ro_cursor(self.db)?;
         if cursor.get(Some(key), None, MDB_SET_KEY).is_err() {
@@ -165,7 +169,19 @@ impl TagIndex {
             };
 
             let (created_at, seq_bytes) = decode_created_at_seq_value(value_bytes)?;
-            entries.push((created_at, seq_bytes));
+
+            if let Some(until_bound) = until
+                && created_at > until_bound
+            {
+                // Skip newer entries until we reach within the until bound.
+            } else {
+                if let Some(since_bound) = since
+                    && created_at < since_bound
+                {
+                    break;
+                }
+                entries.push((created_at, seq_bytes));
+            }
 
             match cursor.get(None, None, MDB_PREV_DUP) {
                 Ok(_) => continue,

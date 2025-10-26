@@ -204,7 +204,7 @@ impl SearchnosDB {
                 )?)
             }
             super::PlanSource::Tags { entries } => {
-                Box::new(self.tag_index.iter_candidates(txn, entries)?)
+                Box::new(self.tag_index.iter_candidates(txn, entries, since, until)?)
             }
             super::PlanSource::Authors { pubkeys } => {
                 let pubkey_refs: Vec<&[u8]> =
