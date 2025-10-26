@@ -1,6 +1,7 @@
 use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
+use lmdb_sys::{MDB_GET_CURRENT, MDB_LAST_DUP, MDB_PREV_DUP, MDB_SET_KEY};
 
 use super::common::{decode_created_at_seq_value, delete_dup_value, put_no_dup};
 use crate::db::{AUTHOR_INDEX_VALUE_BYTES, SEQ_BYTES, SearchnosDBError};
@@ -79,19 +80,40 @@ impl KindsIndex {
             return Ok(Vec::new().into_iter());
         }
 
-        let mut cursor = txn.open_ro_cursor(self.db)?;
+        let cursor = txn.open_ro_cursor(self.db)?;
         let mut results = Vec::new();
 
         for kind in kinds {
             let key = Self::kind_key(*kind);
-            match cursor.iter_dup_of(&key) {
-                Ok(mut iter) => {
-                    for (_key, value) in iter.by_ref() {
-                        let (_indexed_created_at, seq_bytes) = Self::decode_value(value)?;
+
+            match cursor.get(Some(&key), None, MDB_SET_KEY) {
+                Ok(_) => match cursor.get(None, None, MDB_LAST_DUP) {
+                    Ok(_) => loop {
+                        let (_key_bytes, value_bytes) =
+                            match cursor.get(None, None, MDB_GET_CURRENT) {
+                                Ok((Some(key_bytes), value)) => {
+                                    if key_bytes != key.as_slice() {
+                                        break;
+                                    }
+                                    (key_bytes, value)
+                                }
+                                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                                Err(err) => return Err(err.into()),
+                            };
+
+                        let (_indexed_created_at, seq_bytes) = Self::decode_value(value_bytes)?;
                         results.push(seq_bytes);
-                    }
-                }
-                Err(lmdb::Error::NotFound) => {}
+
+                        match cursor.get(None, None, MDB_PREV_DUP) {
+                            Ok(_) => continue,
+                            Err(lmdb::Error::NotFound) => break,
+                            Err(err) => return Err(err.into()),
+                        }
+                    },
+                    Err(lmdb::Error::NotFound) => continue,
+                    Err(err) => return Err(err.into()),
+                },
+                Err(lmdb::Error::NotFound) => continue,
                 Err(err) => return Err(err.into()),
             }
         }
