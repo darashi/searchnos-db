@@ -984,3 +984,28 @@ fn query_omits_events_removed_by_deletion_request() {
     let id_results = db.query(&id_filter);
     assert!(id_results.is_empty());
 }
+
+#[test]
+fn query_with_stats_reports_plan_details() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let event = EventBuilder::text_note("plan timing")
+        .sign_with_keys(&keys)
+        .expect("failed to build event");
+    db.insert(&event);
+
+    let filters = vec![Filter::new().author(keys.public_key())];
+    let result = db.query_with_stats(&filters);
+
+    assert_eq!(result.events, vec![event.as_json()]);
+    assert_eq!(result.stats.filters.len(), 1);
+    assert!(result.stats.total_elapsed >= result.stats.index_scan_duration);
+    assert!(result.stats.total_elapsed >= result.stats.post_processing_duration);
+    match &result.stats.filters[0].plan.source {
+        super::PlanSource::Authors { pubkeys } => {
+            assert_eq!(pubkeys, &vec![keys.public_key()]);
+        }
+        other => panic!("expected Authors plan, got {other:?}"),
+    }
+}

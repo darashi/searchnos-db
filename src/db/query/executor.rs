@@ -1,11 +1,18 @@
-use std::{borrow::Cow, cmp::Ordering, collections::HashSet};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use lmdb::{RoTransaction, Transaction};
 use ndb::{Filter as NdbFilter, NdbNote, from_ndb_note};
 
 use crate::nostr::{Filter, Kind, extract_note_expiration};
 
-use crate::db::{SEQ_BYTES, SearchnosDB, SearchnosDBError};
+use crate::db::{
+    FilterPlanStats, QueryResult, QueryStats, SEQ_BYTES, SearchnosDB, SearchnosDBError,
+};
 use crate::text::{normalize_query_terms, normalize_text};
 
 impl SearchnosDB {
@@ -57,25 +64,49 @@ impl SearchnosDB {
         }
     }
 
-    /// Execute the provided filters and return matching events as normalized JSON strings.
-    pub fn query(&self, filters_json: &str) -> Result<Vec<String>, SearchnosDBError> {
+    /// Execute the provided filters and return matching events alongside timing details.
+    pub fn query_with_stats(&self, filters_json: &str) -> Result<QueryResult, SearchnosDBError> {
+        let total_start = Instant::now();
         let filters = Self::parse_filters_json(filters_json)?;
         let txn = self.begin_ro_txn()?;
         let normalized_filters = self.normalized_filters_or_default(&filters);
         let mut entries: Vec<(u64, [u8; SEQ_BYTES])> = Vec::new();
         let mut seen = HashSet::new();
+        let mut filter_stats = Vec::with_capacity(normalized_filters.len());
+        let mut index_scan_duration = Duration::default();
+        let mut post_processing_duration = Duration::default();
 
         for filter in &normalized_filters {
-            self.append_keys_for_filter(&txn, filter, &mut seen, &mut entries)?;
+            let stats = self.append_keys_for_filter(&txn, filter, &mut seen, &mut entries)?;
+            index_scan_duration += stats.index_scan_duration;
+            post_processing_duration += stats.post_processing_duration;
+            filter_stats.push(stats);
         }
 
+        let final_processing_start = Instant::now();
         entries.sort_unstable_by(|a, b| match b.0.cmp(&a.0) {
             Ordering::Equal => b.1.cmp(&a.1),
             other => other,
         });
 
         let keys: Vec<[u8; SEQ_BYTES]> = entries.into_iter().map(|(_, seq)| seq).collect();
-        self.event_keys_to_json(&txn, &keys)
+        let events = self.event_keys_to_json(&txn, &keys)?;
+        post_processing_duration += final_processing_start.elapsed();
+
+        let stats = QueryStats {
+            total_elapsed: total_start.elapsed(),
+            index_scan_duration,
+            post_processing_duration,
+            filters: filter_stats,
+        };
+
+        Ok(QueryResult { events, stats })
+    }
+
+    /// Backwards-compatible query helper that drops timing stats.
+    pub fn query(&self, filters_json: &str) -> Result<Vec<String>, SearchnosDBError> {
+        self.query_with_stats(filters_json)
+            .map(|result| result.events)
     }
 
     fn append_keys_for_filter<'env>(
@@ -84,19 +115,34 @@ impl SearchnosDB {
         filter: &Filter,
         seen: &mut HashSet<[u8; SEQ_BYTES]>,
         entries: &mut Vec<(u64, [u8; SEQ_BYTES])>,
-    ) -> Result<(), SearchnosDBError> {
-        for (created_at, seq_bytes) in self.collect_event_keys(txn, filter)? {
+    ) -> Result<FilterPlanStats, SearchnosDBError> {
+        let plan = super::QueryPlan::for_filter(filter);
+        let index_start = Instant::now();
+        let mut keys = self.collect_event_keys_for_plan(txn, filter, &plan)?;
+        let index_scan_duration = index_start.elapsed();
+
+        let post_start = Instant::now();
+        let matched_event_count = keys.len();
+        for (created_at, seq_bytes) in keys.drain(..) {
             if seen.insert(seq_bytes) {
                 entries.push((created_at, seq_bytes));
             }
         }
-        Ok(())
+        let post_processing_duration = post_start.elapsed();
+
+        Ok(FilterPlanStats {
+            plan,
+            index_scan_duration,
+            post_processing_duration,
+            matched_event_count,
+        })
     }
 
-    fn collect_event_keys<'env>(
+    fn collect_event_keys_for_plan<'env>(
         &self,
         txn: &'env RoTransaction<'env>,
         filter: &Filter,
+        plan: &super::QueryPlan,
     ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError> {
         if matches!(filter.limit, Some(0)) {
             return Ok(Vec::new());
@@ -111,7 +157,6 @@ impl SearchnosDB {
             return Ok(Vec::new());
         }
 
-        let plan = super::QueryPlan::for_filter(filter);
         // Only include search in ndb_filter if it will be checked (nip50 == true)
         let ndb_filter = Self::to_ndb_filter(filter, plan.match_opts.nip50);
         let since = filter.since.map(|ts| ts.as_u64());
@@ -123,8 +168,8 @@ impl SearchnosDB {
         };
 
         // Get iterator of candidates from the chosen index
-        let candidates: Box<dyn Iterator<Item = [u8; SEQ_BYTES]>> = match plan.source {
-            super::PlanSource::EventIds { ref ids } => {
+        let candidates: Box<dyn Iterator<Item = [u8; SEQ_BYTES]>> = match &plan.source {
+            super::PlanSource::EventIds { ids } => {
                 let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes() as &[u8]).collect();
                 Box::new(self.event_id_index.iter_candidates(txn, &id_refs)?)
             }
@@ -134,10 +179,7 @@ impl SearchnosDB {
                     .expect("filters with search queries must provide normalized terms");
                 Box::new(self.ngram_index.iter_candidates(txn, terms)?)
             }
-            super::PlanSource::PubkeyKinds {
-                ref pubkeys,
-                ref kinds,
-            } => {
+            super::PlanSource::PubkeyKinds { pubkeys, kinds } => {
                 let pubkey_refs: Vec<&[u8]> =
                     pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
                 let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
@@ -149,10 +191,10 @@ impl SearchnosDB {
                     until,
                 )?)
             }
-            super::PlanSource::Tags { ref entries } => {
+            super::PlanSource::Tags { entries } => {
                 Box::new(self.tag_index.iter_candidates(txn, entries)?)
             }
-            super::PlanSource::Authors { ref pubkeys } => {
+            super::PlanSource::Authors { pubkeys } => {
                 let pubkey_refs: Vec<&[u8]> =
                     pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
                 Box::new(
@@ -160,7 +202,7 @@ impl SearchnosDB {
                         .iter_candidates(txn, &pubkey_refs, since, until)?,
                 )
             }
-            super::PlanSource::Kinds { ref kinds } => {
+            super::PlanSource::Kinds { kinds } => {
                 let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
                 Box::new(self.kind_index.iter_candidates(txn, &kind_u16s)?)
             }

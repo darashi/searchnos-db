@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, normalize_text};
 
 use super::{
-    SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
+    QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
     index::{KindsIndex, PubkeyIndex, PubkeyKindIndex, TagIndex},
     write::InsertResult,
 };
@@ -68,6 +68,11 @@ impl TestDatabase {
     pub(crate) fn query(&self, filters: &[Filter]) -> Vec<String> {
         let json = to_json_string(filters).expect("failed to encode filters");
         self.db.query(&json).expect("query failed")
+    }
+
+    pub(crate) fn query_with_stats(&self, filters: &[Filter]) -> QueryResult {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        self.db.query_with_stats(&json).expect("query failed")
     }
 
     pub(crate) fn subscribe(&self, filters: &[Filter]) -> Subscription {

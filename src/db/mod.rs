@@ -14,7 +14,7 @@ mod index;
 mod normalize;
 mod purge;
 mod purge_policy;
-mod query;
+pub mod query;
 mod stat;
 mod subscription;
 #[cfg(test)]
@@ -140,6 +140,33 @@ pub struct DatabaseStats {
     pub total_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub events: Vec<String>,
+    pub stats: QueryStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryStats {
+    pub total_elapsed: Duration,
+    pub index_scan_duration: Duration,
+    pub post_processing_duration: Duration,
+    pub filters: Vec<FilterPlanStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterPlanStats {
+    pub plan: query::QueryPlan,
+    pub index_scan_duration: Duration,
+    pub post_processing_duration: Duration,
+    pub matched_event_count: usize,
+}
+
+pub struct SubscriptionWithStats {
+    pub subscription: Subscription,
+    pub initial_query: QueryStats,
+}
+
 impl SearchnosDB {
     /// Open a database at `path` using default options, creating it if necessary.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SearchnosDBError> {
@@ -208,10 +235,10 @@ impl SearchnosDB {
     }
 
     /// Subscribe to filters, delivering snapshot events followed by an EOSE marker before live updates.
-    pub fn subscribe(
+    pub fn subscribe_with_stats(
         &self,
         filters_json: &str,
-    ) -> Result<subscription::Subscription, SearchnosDBError> {
+    ) -> Result<SubscriptionWithStats, SearchnosDBError> {
         let filters = Self::parse_filters_json(filters_json)?;
         let filter_set = if filters.is_empty() {
             Vec::new()
@@ -222,16 +249,19 @@ impl SearchnosDB {
         let subscription =
             subscription::Subscription::new(id, receiver, self.subscriptions.clone());
 
-        match self.query(filters_json) {
-            Ok(initial_events) => {
-                for event_json in initial_events {
+        match self.query_with_stats(filters_json) {
+            Ok(QueryResult { events, stats }) => {
+                for event_json in events {
                     if sender
                         .try_send(subscription::StreamItem::Event(event_json))
                         .is_err()
                     {
                         // Channel closed or full, stop sending
                         self.subscriptions.unregister(id);
-                        return Ok(subscription);
+                        return Ok(SubscriptionWithStats {
+                            subscription,
+                            initial_query: stats,
+                        });
                     }
                 }
 
@@ -240,7 +270,10 @@ impl SearchnosDB {
                     self.subscriptions.unregister(id);
                 }
 
-                Ok(subscription)
+                Ok(SubscriptionWithStats {
+                    subscription,
+                    initial_query: stats,
+                })
             }
             Err(err) => {
                 self.subscriptions.unregister(id);
@@ -249,13 +282,30 @@ impl SearchnosDB {
         }
     }
 
+    pub fn subscribe(
+        &self,
+        filters_json: &str,
+    ) -> Result<subscription::Subscription, SearchnosDBError> {
+        self.subscribe_with_stats(filters_json)
+            .map(|result| result.subscription)
+    }
+
     /// Async wrapper around `subscribe` that offloads blocking work.
+    pub async fn subscribe_async_with_stats(
+        self: Arc<Self>,
+        filters_json: &str,
+    ) -> Result<SubscriptionWithStats, SearchnosDBError> {
+        let filters_json = filters_json.to_owned();
+        tokio::task::spawn_blocking(move || self.subscribe_with_stats(&filters_json)).await?
+    }
+
     pub async fn subscribe_async(
         self: Arc<Self>,
         filters_json: &str,
     ) -> Result<subscription::Subscription, SearchnosDBError> {
-        let filters_json = filters_json.to_owned();
-        tokio::task::spawn_blocking(move || self.subscribe(&filters_json)).await?
+        self.subscribe_async_with_stats(filters_json)
+            .await
+            .map(|result| result.subscription)
     }
 
     fn effective_limit(&self, provided: Option<usize>) -> Option<usize> {

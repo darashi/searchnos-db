@@ -1,7 +1,7 @@
 mod executor;
-pub(super) mod planner;
+pub mod planner;
 
-pub(super) use planner::{PlanSource, QueryPlan};
+pub use planner::{PlanSource, QueryPlan};
 
 #[cfg(test)]
 mod tests;
