@@ -1010,3 +1010,93 @@ fn query_with_stats_reports_plan_details() {
         other => panic!("expected Authors plan, got {other:?}"),
     }
 }
+
+#[test]
+fn query_kind_index_respects_since_bound_for_candidate_counts() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let old = EventBuilder::text_note("old")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build old event");
+    let new_event = EventBuilder::text_note("new")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build new event");
+    db.insert(&old);
+    db.insert(&new_event);
+
+    let filters = vec![
+        Filter::new()
+            .kind(Kind::TextNote)
+            .since(Timestamp::from_secs(250)),
+    ];
+    let result = db.query_with_stats(&filters);
+
+    assert_eq!(result.events, vec![new_event.as_json()]);
+    let stats = &result.stats.filters[0];
+    assert_eq!(stats.matched_event_count, 1);
+    assert_eq!(stats.candidate_count, 1);
+}
+
+#[test]
+fn query_tag_index_respects_until_bound_for_candidate_counts() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let old = EventBuilder::text_note("old tag")
+        .tag(hashtag_tag("nostr"))
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build old tagged event");
+    let new_event = EventBuilder::text_note("new tag")
+        .tag(hashtag_tag("nostr"))
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build new tagged event");
+    db.insert(&old);
+    db.insert(&new_event);
+
+    let filters = vec![
+        Filter::new()
+            .tag('t', "nostr".to_string())
+            .until(Timestamp::from_secs(150)),
+    ];
+    let result = db.query_with_stats(&filters);
+
+    assert_eq!(result.events, vec![old.as_json()]);
+    let stats = &result.stats.filters[0];
+    assert_eq!(stats.matched_event_count, 1);
+    assert_eq!(stats.candidate_count, 1);
+}
+
+#[test]
+fn query_with_stats_limits_candidate_counts_when_limit_met() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let first = EventBuilder::text_note("first")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build first event");
+    let second = EventBuilder::text_note("second")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build second event");
+    let third = EventBuilder::text_note("third")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build third event");
+    db.insert(&first);
+    db.insert(&second);
+    db.insert(&third);
+
+    let filters = vec![Filter::new().kind(Kind::TextNote).limit(1)];
+    let result = db.query_with_stats(&filters);
+
+    assert_eq!(result.events, vec![first.as_json()]);
+    let stats = &result.stats.filters[0];
+    assert_eq!(stats.matched_event_count, 1);
+    assert_eq!(stats.candidate_count, 1);
+}
