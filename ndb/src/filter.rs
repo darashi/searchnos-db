@@ -130,14 +130,15 @@ impl<'a> NdbNote<'a> {
             return false;
         }
 
-        if opts.nip50
-            && let Some(query) = filter.search.as_ref()
-            && !query.is_empty()
-        {
-            let needle = query.as_bytes();
-            if !content
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle))
+        if opts.nip50 && let Some(query) = filter.search.as_ref() {
+            let terms: Vec<&str> = query.split_whitespace().collect();
+            if !terms.is_empty()
+                && !terms.iter().all(|term| {
+                    let needle = term.as_bytes();
+                    content
+                        .windows(needle.len())
+                        .any(|window| window.eq_ignore_ascii_case(needle))
+                })
             {
                 return false;
             }

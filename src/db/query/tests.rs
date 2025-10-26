@@ -222,6 +222,33 @@ fn query_handles_single_character_search_via_ngram_index() {
 }
 
 #[test]
+fn query_search_rejects_false_positive_candidates() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let matching = EventBuilder::text_note("lole")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build matching event");
+    let false_positive = EventBuilder::text_note("console lol")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build false-positive event");
+
+    db.insert(&matching);
+    db.insert(&false_positive);
+
+    let filters = vec![Filter::new().search("lole")];
+    let results = db.query(&filters);
+
+    assert_eq!(
+        results,
+        vec![matching.as_json()],
+        "only the event containing the full search term should be returned"
+    );
+}
+
+#[test]
 fn query_search_respects_since_boundary() {
     let db = TestDatabase::new();
     let keys = Keys::generate();

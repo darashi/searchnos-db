@@ -39,27 +39,37 @@ pub struct QueryPlan {
 impl QueryPlan {
     /// Choose an index-backed plan for a single Nostr filter and adjust match options accordingly.
     pub fn for_filter(filter: &Filter) -> Self {
+        let mut normalized_terms: Option<Vec<String>> = None;
+        let has_search_terms = if let Some(search) = filter.search.as_ref() {
+            let terms = normalize_query_terms(search);
+            if terms.is_empty() {
+                false
+            } else {
+                normalized_terms = Some(terms);
+                true
+            }
+        } else {
+            false
+        };
+
         if let Some(ids) = filter.ids.as_ref()
             && !ids.is_empty()
         {
             // EventIds index resolves: id
-            let match_opts = MatchEventOptions::new().id(false).nip50(false);
+            let match_opts = MatchEventOptions::new().id(false).nip50(has_search_terms);
             return Self {
                 source: PlanSource::EventIds { ids: ids.to_vec() },
                 match_opts,
             };
         }
 
-        if let Some(search) = filter.search.as_ref() {
-            let terms = normalize_query_terms(search);
-            if !terms.is_empty() {
-                // NgramSearch index resolves: search content
-                let match_opts = MatchEventOptions::new().nip50(false);
-                return Self {
-                    source: PlanSource::NgramSearch { terms },
-                    match_opts,
-                };
-            }
+        if let Some(terms) = normalized_terms.clone() {
+            // NgramSearch index resolves: search content
+            let match_opts = MatchEventOptions::new().nip50(true);
+            return Self {
+                source: PlanSource::NgramSearch { terms },
+                match_opts,
+            };
         }
 
         if let (Some(authors), Some(kinds)) = (filter.authors.as_ref(), filter.kinds.as_ref())
@@ -74,7 +84,7 @@ impl QueryPlan {
                     .kind(false)
                     .since(false)
                     .until(false)
-                    .nip50(false);
+                    .nip50(has_search_terms);
                 return Self {
                     source: PlanSource::PubkeyKinds {
                         pubkeys: authors.to_vec(),
@@ -94,7 +104,7 @@ impl QueryPlan {
                 .collect();
             if !entries.is_empty() {
                 // Tags index resolves: generic_tags
-                let match_opts = MatchEventOptions::new().tags(false).nip50(false);
+                let match_opts = MatchEventOptions::new().tags(false).nip50(has_search_terms);
                 return Self {
                     source: PlanSource::Tags { entries },
                     match_opts,
@@ -110,7 +120,7 @@ impl QueryPlan {
                 .author(false)
                 .since(false)
                 .until(false)
-                .nip50(false);
+                .nip50(has_search_terms);
             return Self {
                 source: PlanSource::Authors {
                     pubkeys: authors.to_vec(),
@@ -123,7 +133,7 @@ impl QueryPlan {
             && !kinds.is_empty()
         {
             // Kinds index resolves: kind
-            let match_opts = MatchEventOptions::new().kind(false).nip50(false);
+            let match_opts = MatchEventOptions::new().kind(false).nip50(has_search_terms);
             return Self {
                 source: PlanSource::Kinds {
                     kinds: kinds.to_vec(),
@@ -138,7 +148,7 @@ impl QueryPlan {
             match_opts: MatchEventOptions::new()
                 .since(false)
                 .until(false)
-                .nip50(false),
+                .nip50(has_search_terms),
         }
     }
 }

@@ -102,11 +102,12 @@ impl SearchnosDB {
             return Ok(Vec::new());
         }
 
-        if filter
+        let search_terms = filter
             .search
             .as_ref()
-            .is_some_and(|search| normalize_query_terms(search).is_empty())
-        {
+            .map(|search| normalize_query_terms(search));
+
+        if search_terms.as_ref().is_some_and(|terms| terms.is_empty()) {
             return Ok(Vec::new());
         }
 
@@ -122,7 +123,10 @@ impl SearchnosDB {
                 let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes() as &[u8]).collect();
                 Box::new(self.event_id_index.iter_candidates(txn, &id_refs)?)
             }
-            super::PlanSource::NgramSearch { ref terms } => {
+            super::PlanSource::NgramSearch { .. } => {
+                let terms = search_terms
+                    .as_ref()
+                    .expect("filters with search queries must provide normalized terms");
                 Box::new(self.ngram_index.iter_candidates(txn, terms)?)
             }
             super::PlanSource::PubkeyKinds {
