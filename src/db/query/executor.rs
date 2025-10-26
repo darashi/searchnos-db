@@ -216,7 +216,10 @@ impl SearchnosDB {
             }
             super::PlanSource::Kinds { kinds } => {
                 let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
-                Box::new(self.kind_index.iter_candidates(txn, &kind_u16s)?)
+                Box::new(
+                    self.kind_index
+                        .iter_candidates(txn, &kind_u16s, since, until)?,
+                )
             }
             super::PlanSource::CreatedAt => {
                 Box::new(self.created_at_index.iter_candidates(txn, since, until)?)

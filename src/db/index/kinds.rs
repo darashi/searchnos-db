@@ -70,11 +70,13 @@ impl KindsIndex {
         decode_created_at_seq_value(bytes)
     }
 
-    /// Iterate over all seq_bytes for the given kinds
+    /// Iterate over all seq_bytes for the given kinds, honoring optional created_at bounds.
     pub fn iter_candidates<'env>(
         &self,
         txn: &'env RoTransaction<'env>,
         kinds: &[u16],
+        since: Option<u64>,
+        until: Option<u64>,
     ) -> Result<impl Iterator<Item = [u8; SEQ_BYTES]> + 'env, SearchnosDBError> {
         if kinds.is_empty() {
             return Ok(Vec::new().into_iter());
@@ -101,8 +103,21 @@ impl KindsIndex {
                                 Err(err) => return Err(err.into()),
                             };
 
-                        let (_indexed_created_at, seq_bytes) = Self::decode_value(value_bytes)?;
-                        results.push(seq_bytes);
+                        let (indexed_created_at, seq_bytes) = Self::decode_value(value_bytes)?;
+
+                        if let Some(until_bound) = until
+                            && indexed_created_at > until_bound
+                        {
+                            // Skip newer entries until we reach the until bound.
+                        } else {
+                            if let Some(since_bound) = since
+                                && indexed_created_at < since_bound
+                            {
+                                // Older than since bound; stop scanning this kind.
+                                break;
+                            }
+                            results.push(seq_bytes);
+                        }
 
                         match cursor.get(None, None, MDB_PREV_DUP) {
                             Ok(_) => continue,
