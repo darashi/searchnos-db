@@ -15,6 +15,11 @@ use crate::db::{
 };
 use crate::text::{normalize_query_terms, normalize_text};
 
+struct PlanCollectionResult {
+    keys: Vec<(u64, [u8; SEQ_BYTES])>,
+    candidate_count: usize,
+}
+
 impl SearchnosDB {
     pub(crate) fn to_ndb_filter(filter: &Filter, include_search: bool) -> NdbFilter {
         let ids = filter
@@ -118,12 +123,12 @@ impl SearchnosDB {
     ) -> Result<FilterPlanStats, SearchnosDBError> {
         let plan = super::QueryPlan::for_filter(filter);
         let index_start = Instant::now();
-        let mut keys = self.collect_event_keys_for_plan(txn, filter, &plan)?;
+        let mut collection = self.collect_event_keys_for_plan(txn, filter, &plan)?;
         let index_scan_duration = index_start.elapsed();
 
         let post_start = Instant::now();
-        let matched_event_count = keys.len();
-        for (created_at, seq_bytes) in keys.drain(..) {
+        let matched_event_count = collection.keys.len();
+        for (created_at, seq_bytes) in collection.keys.drain(..) {
             if seen.insert(seq_bytes) {
                 entries.push((created_at, seq_bytes));
             }
@@ -135,6 +140,7 @@ impl SearchnosDB {
             index_scan_duration,
             post_processing_duration,
             matched_event_count,
+            candidate_count: collection.candidate_count,
         })
     }
 
@@ -143,9 +149,12 @@ impl SearchnosDB {
         txn: &'env RoTransaction<'env>,
         filter: &Filter,
         plan: &super::QueryPlan,
-    ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError> {
+    ) -> Result<PlanCollectionResult, SearchnosDBError> {
         if matches!(filter.limit, Some(0)) {
-            return Ok(Vec::new());
+            return Ok(PlanCollectionResult {
+                keys: Vec::new(),
+                candidate_count: 0,
+            });
         }
 
         let search_terms = filter
@@ -154,7 +163,10 @@ impl SearchnosDB {
             .map(|search| normalize_query_terms(search));
 
         if search_terms.as_ref().is_some_and(|terms| terms.is_empty()) {
-            return Ok(Vec::new());
+            return Ok(PlanCollectionResult {
+                keys: Vec::new(),
+                candidate_count: 0,
+            });
         }
 
         // Only include search in ndb_filter if it will be checked (nip50 == true)
@@ -213,7 +225,9 @@ impl SearchnosDB {
 
         // Apply unified filtering logic
         let mut keys = Vec::new();
+        let mut candidate_count = 0usize;
         for seq_bytes in candidates {
+            candidate_count = candidate_count.saturating_add(1);
             let (note, content_bytes) = self.load_note_and_content(txn, &seq_bytes)?;
 
             // Check all filter conditions
@@ -248,7 +262,10 @@ impl SearchnosDB {
             keys.truncate(limit);
         }
 
-        Ok(keys)
+        Ok(PlanCollectionResult {
+            keys,
+            candidate_count,
+        })
     }
 
     fn load_note_and_content<'env>(

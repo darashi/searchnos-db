@@ -1002,6 +1002,7 @@ fn query_with_stats_reports_plan_details() {
     assert_eq!(result.stats.filters.len(), 1);
     assert!(result.stats.total_elapsed >= result.stats.index_scan_duration);
     assert!(result.stats.total_elapsed >= result.stats.post_processing_duration);
+    assert!(result.stats.filters[0].candidate_count >= result.stats.filters[0].matched_event_count);
     match &result.stats.filters[0].plan.source {
         super::PlanSource::Authors { pubkeys } => {
             assert_eq!(pubkeys, &vec![keys.public_key()]);

@@ -160,6 +160,7 @@ pub struct FilterPlanStats {
     pub index_scan_duration: Duration,
     pub post_processing_duration: Duration,
     pub matched_event_count: usize,
+    pub candidate_count: usize,
 }
 
 pub struct SubscriptionWithStats {
