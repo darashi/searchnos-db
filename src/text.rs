@@ -69,6 +69,12 @@ pub fn normalize_query_terms(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Choose a minimum n-gram size for search queries based on the term length.
+pub fn preferred_min_query_ngram_size(term: &str) -> usize {
+    let len = term.chars().count();
+    len.clamp(MIN_NGRAM_SIZE, MAX_NGRAM_SIZE)
+}
+
 /// Default minimum and maximum character counts for generated n-grams.
 pub const MIN_NGRAM_SIZE: usize = 1;
 pub const MAX_NGRAM_SIZE: usize = 3;
@@ -181,5 +187,14 @@ mod tests {
 
         assert_eq!(normalized, "wow!");
         assert!(normalized.contains("!"));
+    }
+
+    #[test]
+    fn preferred_min_query_ngram_size_scales_with_length() {
+        assert_eq!(preferred_min_query_ngram_size("h"), MIN_NGRAM_SIZE);
+        assert_eq!(preferred_min_query_ngram_size("hi"), 2);
+        assert_eq!(preferred_min_query_ngram_size("abc"), MAX_NGRAM_SIZE);
+        assert_eq!(preferred_min_query_ngram_size("rust"), MAX_NGRAM_SIZE);
+        assert_eq!(preferred_min_query_ngram_size("nostr"), MAX_NGRAM_SIZE);
     }
 }

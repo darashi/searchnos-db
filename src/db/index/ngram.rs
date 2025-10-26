@@ -7,7 +7,7 @@ use lmdb::{
 use lmdb_sys::MDB_GET_BOTH;
 
 use crate::db::{SEQ_BYTES, SearchnosDBError};
-use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams};
+use crate::text::{MAX_NGRAM_SIZE, char_ngrams, preferred_min_query_ngram_size};
 
 #[derive(Debug)]
 pub struct NgramIndex {
@@ -80,7 +80,8 @@ impl NgramIndex {
         let mut global_candidates: Option<HashSet<[u8; SEQ_BYTES]>> = None;
 
         for term in terms {
-            let grams = char_ngrams(term, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE);
+            let min_gram = preferred_min_query_ngram_size(term);
+            let grams = char_ngrams(term, min_gram, MAX_NGRAM_SIZE);
             if grams.is_empty() {
                 return Ok(Vec::new().into_iter());
             }
