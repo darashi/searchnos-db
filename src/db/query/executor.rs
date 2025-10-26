@@ -116,6 +116,11 @@ impl SearchnosDB {
         let ndb_filter = Self::to_ndb_filter(filter, plan.match_opts.nip50);
         let since = filter.since.map(|ts| ts.as_u64());
         let until = filter.until.map(|ts| ts.as_u64());
+        let early_exit_limit = if plan.source.produces_descending_created_at() {
+            filter.limit.filter(|&limit| limit > 0)
+        } else {
+            None
+        };
 
         // Get iterator of candidates from the chosen index
         let candidates: Box<dyn Iterator<Item = [u8; SEQ_BYTES]>> = match plan.source {
@@ -183,6 +188,12 @@ impl SearchnosDB {
 
             let created_at = note.created_at();
             keys.push((created_at, seq_bytes));
+
+            if let Some(limit) = early_exit_limit
+                && keys.len() >= limit
+            {
+                break;
+            }
         }
 
         if let Some(limit) = filter.limit

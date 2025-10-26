@@ -1,6 +1,7 @@
 use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
+use lmdb_sys::{MDB_GET_CURRENT, MDB_LAST_DUP, MDB_PREV_DUP, MDB_SET_KEY};
 
 use super::common::{
     decode_created_at_seq_value, delete_dup_value, encode_created_at_seq_value, put_no_dup,
@@ -75,19 +76,34 @@ impl PubkeyIndex {
             return Ok(Vec::new().into_iter());
         }
 
-        let mut cursor = txn.open_ro_cursor(self.db)?;
+        let cursor = txn.open_ro_cursor(self.db)?;
         let mut results = Vec::new();
 
         for author in authors {
-            match cursor.iter_dup_of(author) {
-                Ok(mut iter) => {
-                    for (_key, value) in iter.by_ref() {
-                        let (indexed_created_at, seq_bytes) = Self::decode_value(value)?;
+            match cursor.get(Some(author), None, MDB_SET_KEY) {
+                Ok(_) => match cursor.get(None, None, MDB_LAST_DUP) {
+                    Ok(_) => loop {
+                        let value_bytes = match cursor.get(None, None, MDB_GET_CURRENT) {
+                            Ok((Some(key), value)) => {
+                                if key != *author {
+                                    break;
+                                }
+                                value
+                            }
+                            Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                            Err(err) => return Err(err.into()),
+                        };
+
+                        let (indexed_created_at, seq_bytes) = Self::decode_value(value_bytes)?;
 
                         if let Some(until) = until
                             && indexed_created_at > until
                         {
-                            break;
+                            match cursor.get(None, None, MDB_PREV_DUP) {
+                                Ok(_) => continue,
+                                Err(lmdb::Error::NotFound) => break,
+                                Err(err) => return Err(err.into()),
+                            }
                         }
 
                         if let Some(since) = since
@@ -97,9 +113,17 @@ impl PubkeyIndex {
                         }
 
                         results.push(seq_bytes);
-                    }
-                }
-                Err(lmdb::Error::NotFound) => {}
+
+                        match cursor.get(None, None, MDB_PREV_DUP) {
+                            Ok(_) => continue,
+                            Err(lmdb::Error::NotFound) => break,
+                            Err(err) => return Err(err.into()),
+                        }
+                    },
+                    Err(lmdb::Error::NotFound) => continue,
+                    Err(err) => return Err(err.into()),
+                },
+                Err(lmdb::Error::NotFound) => continue,
                 Err(err) => return Err(err.into()),
             }
         }

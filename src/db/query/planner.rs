@@ -36,6 +36,19 @@ pub struct QueryPlan {
     pub match_opts: MatchEventOptions,
 }
 
+impl PlanSource {
+    /// Whether candidate iteration yields events in descending created_at order.
+    pub fn produces_descending_created_at(&self) -> bool {
+        matches!(
+            self,
+            PlanSource::CreatedAt
+                | PlanSource::Kinds { .. }
+                | PlanSource::Authors { .. }
+                | PlanSource::PubkeyKinds { .. }
+        )
+    }
+}
+
 impl QueryPlan {
     /// Choose an index-backed plan for a single Nostr filter and adjust match options accordingly.
     pub fn for_filter(filter: &Filter) -> Self {
