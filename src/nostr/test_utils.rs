@@ -1,5 +1,4 @@
-use rand::rngs::OsRng;
-use secp256k1::{Keypair, Message, Secp256k1};
+use secp256k1::{Keypair, Secp256k1};
 use serde_json::{Map, Value};
 
 use super::{
@@ -108,7 +107,7 @@ pub struct Keys {
 impl Keys {
     pub fn generate() -> Self {
         let secp = Secp256k1::new();
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let keypair = Keypair::new(&secp, &mut rng);
         let (xonly, _) = keypair.x_only_public_key();
         let public_key = PublicKey::from_bytes(xonly.serialize());
@@ -124,10 +123,9 @@ impl Keys {
 
     pub fn sign(&self, message: &[u8; 32]) -> Result<Signature, EventError> {
         let secp = Secp256k1::new();
-        let msg = Message::from_digest_slice(message).map_err(|_| EventError::InvalidId)?;
-        let mut rng = OsRng;
-        let signature = secp.sign_schnorr_with_rng(&msg, &self.keypair, &mut rng);
-        Ok(Signature::from_bytes(signature.serialize()))
+        let mut rng = rand::rng();
+        let signature = secp.sign_schnorr_with_rng(message, &self.keypair, &mut rng);
+        Ok(Signature::from_bytes(signature.to_byte_array()))
     }
 }
 

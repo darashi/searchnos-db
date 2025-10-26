@@ -1,5 +1,5 @@
 use secp256k1::schnorr::Signature as SchnorrSignature;
-use secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+use secp256k1::{Secp256k1, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -140,14 +140,11 @@ impl Event {
         }
 
         let secp = Secp256k1::verification_only();
-        let pubkey = XOnlyPublicKey::from_slice(self.pubkey.as_bytes())
+        let pubkey = XOnlyPublicKey::from_byte_array(*self.pubkey.as_bytes())
             .map_err(|_| EventError::InvalidPublicKey)?;
-        let signature = SchnorrSignature::from_slice(self.sig.as_bytes())
-            .map_err(|_| EventError::InvalidSignature)?;
+        let signature = SchnorrSignature::from_byte_array(*self.sig.as_bytes());
 
-        let msg = Message::from_digest_slice(expected_id.as_bytes())
-            .map_err(|_| EventError::InvalidId)?;
-        secp.verify_schnorr(&signature, &msg, &pubkey)
+        secp.verify_schnorr(&signature, expected_id.as_bytes(), &pubkey)
             .map_err(|_| EventError::InvalidSignature)
     }
 
