@@ -180,56 +180,62 @@ impl SearchnosDB {
         };
 
         // Get iterator of candidates from the chosen index
-        let candidates: Box<dyn Iterator<Item = [u8; SEQ_BYTES]>> = match &plan.source {
-            super::PlanSource::EventIds { ids } => {
-                let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes() as &[u8]).collect();
-                Box::new(self.event_id_index.iter_candidates(txn, &id_refs)?)
-            }
-            super::PlanSource::NgramSearch { .. } => {
-                let terms = search_terms
-                    .as_ref()
-                    .expect("filters with search queries must provide normalized terms");
-                Box::new(self.ngram_index.iter_candidates(txn, terms)?)
-            }
-            super::PlanSource::PubkeyKinds { pubkeys, kinds } => {
-                let pubkey_refs: Vec<&[u8]> =
-                    pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
-                let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
-                Box::new(self.pubkey_kind_index.iter_candidates(
-                    txn,
-                    &pubkey_refs,
-                    &kind_u16s,
-                    since,
-                    until,
-                )?)
-            }
-            super::PlanSource::Tags { entries } => {
-                Box::new(self.tag_index.iter_candidates(txn, entries, since, until)?)
-            }
-            super::PlanSource::Authors { pubkeys } => {
-                let pubkey_refs: Vec<&[u8]> =
-                    pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
-                Box::new(
-                    self.pubkey_index
-                        .iter_candidates(txn, &pubkey_refs, since, until)?,
-                )
-            }
-            super::PlanSource::Kinds { kinds } => {
-                let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
-                Box::new(
-                    self.kind_index
-                        .iter_candidates(txn, &kind_u16s, since, until)?,
-                )
-            }
-            super::PlanSource::CreatedAt => {
-                Box::new(self.created_at_index.iter_candidates(txn, since, until)?)
-            }
-        };
+        let candidates: Box<dyn Iterator<Item = Result<[u8; SEQ_BYTES], SearchnosDBError>> + 'env> =
+            match &plan.source {
+                super::PlanSource::EventIds { ids } => {
+                    let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes() as &[u8]).collect();
+                    Box::new(self.event_id_index.iter_candidates(txn, &id_refs)?.map(Ok))
+                }
+                super::PlanSource::NgramSearch { .. } => {
+                    let terms = search_terms
+                        .as_ref()
+                        .expect("filters with search queries must provide normalized terms");
+                    Box::new(self.ngram_index.iter_candidates(txn, terms, since, until)?)
+                }
+                super::PlanSource::PubkeyKinds { pubkeys, kinds } => {
+                    let pubkey_refs: Vec<&[u8]> =
+                        pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
+                    let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
+                    Box::new(
+                        self.pubkey_kind_index
+                            .iter_candidates(txn, &pubkey_refs, &kind_u16s, since, until)?
+                            .map(Ok),
+                    )
+                }
+                super::PlanSource::Tags { entries } => Box::new(
+                    self.tag_index
+                        .iter_candidates(txn, entries, since, until)?
+                        .map(Ok),
+                ),
+                super::PlanSource::Authors { pubkeys } => {
+                    let pubkey_refs: Vec<&[u8]> =
+                        pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
+                    Box::new(
+                        self.pubkey_index
+                            .iter_candidates(txn, &pubkey_refs, since, until)?
+                            .map(Ok),
+                    )
+                }
+                super::PlanSource::Kinds { kinds } => {
+                    let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
+                    Box::new(
+                        self.kind_index
+                            .iter_candidates(txn, &kind_u16s, since, until)?
+                            .map(Ok),
+                    )
+                }
+                super::PlanSource::CreatedAt => Box::new(
+                    self.created_at_index
+                        .iter_candidates(txn, since, until)?
+                        .map(Ok),
+                ),
+            };
 
         // Apply unified filtering logic
         let mut keys = Vec::new();
         let mut candidate_count = 0usize;
-        for seq_bytes in candidates {
+        for candidate in candidates {
+            let seq_bytes = candidate?;
             candidate_count = candidate_count.saturating_add(1);
             let (note, content_bytes) = self.load_note_and_content(txn, &seq_bytes)?;
 

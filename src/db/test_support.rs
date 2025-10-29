@@ -4,7 +4,9 @@ use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, nor
 
 use super::{
     QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
-    index::{KindsIndex, PubkeyIndex, PubkeyKindIndex, TagIndex},
+    index::{
+        KindsIndex, PubkeyIndex, PubkeyKindIndex, TagIndex, common::decode_created_at_seq_value,
+    },
     write::InsertResult,
 };
 
@@ -137,7 +139,7 @@ impl TestDatabase {
 
         for gram in char_ngrams(stored_content, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
             assert!(
-                self.ngram_contains(txn, &gram, seq),
+                self.ngram_contains(txn, &gram, event.created_at.as_u64(), seq),
                 "ngram index missing seq {seq} for gram '{gram}'"
             );
         }
@@ -225,7 +227,7 @@ impl TestDatabase {
         let normalized = normalize_text(&extract_text(event));
         for gram in char_ngrams(&normalized, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
             assert!(
-                !self.ngram_contains(txn, &gram, seq),
+                !self.ngram_contains(txn, &gram, event.created_at.as_u64(), seq),
                 "ngram index retained seq {seq} for gram '{gram}'"
             );
         }
@@ -345,14 +347,24 @@ impl TestDatabase {
         }
     }
 
-    fn ngram_contains(&self, txn: &RoTransaction<'_>, gram: &str, seq: u64) -> bool {
+    fn ngram_contains(
+        &self,
+        txn: &RoTransaction<'_>,
+        gram: &str,
+        created_at: u64,
+        seq: u64,
+    ) -> bool {
         let mut cursor = txn
             .open_ro_cursor(self.db.ngram_index.database())
             .expect("failed to open ngram cursor");
-        let seq_bytes = seq.to_ne_bytes();
         let bytes = gram.as_bytes();
         match cursor.iter_dup_of(&bytes) {
-            Ok(mut iter) => iter.any(|(_, value)| value == seq_bytes),
+            Ok(mut iter) => iter.any(|(_, value)| match decode_created_at_seq_value(value) {
+                Ok((stored_created_at, stored_seq_bytes)) => {
+                    stored_created_at == created_at && stored_seq_bytes == seq.to_ne_bytes()
+                }
+                Err(_) => false,
+            }),
             Err(lmdb::Error::NotFound) => false,
             Err(err) => panic!("unexpected ngram cursor error: {err}"),
         }

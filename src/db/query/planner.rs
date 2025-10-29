@@ -39,14 +39,15 @@ pub struct QueryPlan {
 impl PlanSource {
     /// Whether candidate iteration yields events in descending created_at order.
     pub fn produces_descending_created_at(&self) -> bool {
-        matches!(
-            self,
+        match self {
             PlanSource::CreatedAt
-                | PlanSource::Kinds { .. }
-                | PlanSource::Authors { .. }
-                | PlanSource::PubkeyKinds { .. }
-                | PlanSource::Tags { .. }
-        )
+            | PlanSource::Kinds { .. }
+            | PlanSource::Authors { .. }
+            | PlanSource::PubkeyKinds { .. }
+            | PlanSource::Tags { .. }
+            | PlanSource::NgramSearch { .. } => true,
+            PlanSource::EventIds { .. } => false,
+        }
     }
 }
 

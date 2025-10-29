@@ -253,7 +253,13 @@ impl SearchnosDB {
         prepared: &PreparedInsert,
     ) -> Result<u64, SearchnosDBError> {
         let seq = self.next_seq(txn)?;
-        self.insert_event_data(txn, seq, &prepared.note_bytes, &prepared.index_data)?;
+        self.insert_event_data(
+            txn,
+            seq,
+            event.created_at.as_u64(),
+            &prepared.note_bytes,
+            &prepared.index_data,
+        )?;
         self.update_indexes(txn, seq, event, &prepared.index_data, prepared.expiration)?;
         Ok(seq)
     }
@@ -263,6 +269,7 @@ impl SearchnosDB {
         &self,
         txn: &mut RwTransaction<'env>,
         seq: u64,
+        created_at: u64,
         note_bytes: &[u8],
         index_data: &EventIndexData,
     ) -> Result<(), SearchnosDBError> {
@@ -271,9 +278,8 @@ impl SearchnosDB {
         self.contents
             .put(txn, &key_bytes, &index_data.normalized_content)?;
 
-        let seq_bytes = seq.to_ne_bytes();
         for gram in &index_data.ngrams {
-            self.ngram_index.put(txn, gram, &seq_bytes)?;
+            self.ngram_index.put(txn, gram, created_at, seq)?;
         }
 
         Ok(())
@@ -518,7 +524,7 @@ impl SearchnosDB {
             for gram in char_ngrams(&content, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
                 let gram_bytes = gram.into_bytes();
                 self.ngram_index
-                    .delete_entry(txn, &gram_bytes, &event_key)?;
+                    .delete_entry(txn, &gram_bytes, event.created_at.as_u64(), seq)?;
             }
         }
 
