@@ -8,6 +8,12 @@ use lmdb_sys::{MDB_GET_CURRENT, MDB_LAST, MDB_PREV, MDB_SET_RANGE};
 
 use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
+pub struct CreatedAtIter<'txn> {
+    cursor: RoCursor<'txn>,
+    since: Option<u64>,
+    finished: bool,
+}
+
 #[derive(Debug)]
 pub struct CreatedAtIndex {
     db: Database,
@@ -107,41 +113,71 @@ impl CreatedAtIndex {
         txn: &'env RoTransaction<'env>,
         since: Option<u64>,
         until: Option<u64>,
-    ) -> Result<impl Iterator<Item = [u8; SEQ_BYTES]> + 'env, SearchnosDBError> {
+    ) -> Result<CreatedAtIter<'env>, SearchnosDBError> {
         let mut cursor = txn.open_ro_cursor(self.db)?;
 
-        if !Self::position_cursor(&mut cursor, until)? {
-            return Ok(Vec::new().into_iter());
+        let positioned = Self::position_cursor(&mut cursor, until)?;
+        Ok(CreatedAtIter {
+            cursor,
+            since,
+            finished: !positioned,
+        })
+    }
+}
+
+impl<'txn> Iterator for CreatedAtIter<'txn> {
+    type Item = Result<[u8; SEQ_BYTES], SearchnosDBError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
         }
 
-        let mut results = Vec::new();
-        loop {
-            let (key_bytes, value_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
-                Ok((Some(key), value)) => (key, value),
-                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
-                Err(err) => return Err(err.into()),
-            };
+        let (key_bytes, value_bytes) = match self.cursor.get(None, None, MDB_GET_CURRENT) {
+            Ok((Some(key), value)) => (key, value),
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => {
+                self.finished = true;
+                return None;
+            }
+            Err(err) => {
+                self.finished = true;
+                return Some(Err(err.into()));
+            }
+        };
 
-            // Check since boundary - stop if we've gone too far back
-            if let Some(since) = since {
-                let created_at = Self::created_at_from_bytes(key_bytes)?;
-                if created_at < since {
-                    break;
+        if let Some(since) = self.since {
+            match CreatedAtIndex::created_at_from_bytes(key_bytes) {
+                Ok(created_at) if created_at < since => {
+                    self.finished = true;
+                    return None;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(err));
                 }
             }
+        }
 
-            let seq_bytes: [u8; SEQ_BYTES] = value_bytes
-                .try_into()
-                .map_err(|_| SearchnosDBError::InvalidSeqLength(value_bytes.len()))?;
-            results.push(seq_bytes);
+        let seq_bytes: [u8; SEQ_BYTES] = match value_bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.finished = true;
+                return Some(Err(SearchnosDBError::InvalidSeqLength(value_bytes.len())));
+            }
+        };
 
-            match cursor.get(None, None, MDB_PREV) {
-                Ok(_) => {}
-                Err(lmdb::Error::NotFound) => break,
-                Err(err) => return Err(err.into()),
+        match self.cursor.get(None, None, MDB_PREV) {
+            Ok(_) => {}
+            Err(lmdb::Error::NotFound) => {
+                self.finished = true;
+            }
+            Err(err) => {
+                self.finished = true;
+                return Some(Err(err.into()));
             }
         }
 
-        Ok(results.into_iter())
+        Some(Ok(seq_bytes))
     }
 }

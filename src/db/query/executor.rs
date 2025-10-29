@@ -224,11 +224,9 @@ impl SearchnosDB {
                             .map(Ok),
                     )
                 }
-                super::PlanSource::CreatedAt => Box::new(
-                    self.created_at_index
-                        .iter_candidates(txn, since, until)?
-                        .map(Ok),
-                ),
+                super::PlanSource::CreatedAt => {
+                    Box::new(self.created_at_index.iter_candidates(txn, since, until)?)
+                }
             };
 
         // Apply unified filtering logic
