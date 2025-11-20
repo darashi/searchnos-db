@@ -1,63 +1,85 @@
-use lmdb::{Cursor, Database, RwCursor, RwTransaction, WriteFlags};
-use lmdb_sys::MDB_GET_BOTH;
+use lmdb::{Cursor, Database, RoCursor, RwTransaction, WriteFlags};
+use lmdb_sys::{MDB_NEXT, MDB_PREV, MDB_SET_RANGE};
 
-use crate::db::{AUTHOR_INDEX_VALUE_BYTES, CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
+use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
-/// Encode a (created_at, seq) pair into the value format used by multiple indexes
-pub fn encode_created_at_seq_value(created_at: u64, seq: u64) -> [u8; AUTHOR_INDEX_VALUE_BYTES] {
-    let mut buffer = [0u8; AUTHOR_INDEX_VALUE_BYTES];
-    buffer[..CREATED_AT_BYTES].copy_from_slice(&created_at.to_be_bytes());
-    buffer[CREATED_AT_BYTES..].copy_from_slice(&seq.to_be_bytes());
-    buffer
+pub const TS_SEQ_BYTES: usize = CREATED_AT_BYTES + SEQ_BYTES;
+
+/// Append created_at/seq suffix (big-endian) to the provided key buffer.
+pub fn append_ts_seq(key: &mut Vec<u8>, created_at: u64, seq: u64) {
+    key.extend_from_slice(&created_at.to_be_bytes());
+    key.extend_from_slice(&seq.to_be_bytes());
 }
 
-/// Decode a value from the format used by multiple indexes into (created_at, seq_bytes)
-pub fn decode_created_at_seq_value(
-    bytes: &[u8],
-) -> Result<(u64, [u8; SEQ_BYTES]), SearchnosDBError> {
-    if bytes.len() != AUTHOR_INDEX_VALUE_BYTES {
-        return Err(SearchnosDBError::InvalidIndexValueLength(bytes.len()));
+/// Extract created_at and seq suffix from a key.
+pub fn split_ts_seq_from_key(key: &[u8]) -> Result<(u64, [u8; SEQ_BYTES]), SearchnosDBError> {
+    if key.len() < TS_SEQ_BYTES {
+        return Err(SearchnosDBError::InvalidKeyLength(key.len()));
     }
-
+    let suffix = &key[key.len() - TS_SEQ_BYTES..];
     let mut created_at_bytes = [0u8; CREATED_AT_BYTES];
-    created_at_bytes.copy_from_slice(&bytes[..CREATED_AT_BYTES]);
-    let created_at = u64::from_be_bytes(created_at_bytes);
-
+    created_at_bytes.copy_from_slice(&suffix[..CREATED_AT_BYTES]);
     let mut seq_bytes_be = [0u8; SEQ_BYTES];
-    seq_bytes_be.copy_from_slice(&bytes[CREATED_AT_BYTES..]);
+    seq_bytes_be.copy_from_slice(&suffix[CREATED_AT_BYTES..]);
     let seq = u64::from_be_bytes(seq_bytes_be);
-
-    Ok((created_at, seq.to_ne_bytes()))
+    Ok((u64::from_be_bytes(created_at_bytes), seq.to_ne_bytes()))
 }
 
-/// Helper to delete a specific duplicate value from a DUP_SORT database
-pub fn delete_dup_value(
-    cursor: &mut RwCursor<'_>,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), SearchnosDBError> {
-    match cursor.get(Some(key), Some(value), MDB_GET_BOTH) {
-        Ok(_) => match cursor.del(WriteFlags::CURRENT) {
-            Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
-            Err(err) => Err(err.into()),
-        },
-        Err(lmdb::Error::NotFound) => Ok(()),
-        Err(err) => Err(err.into()),
+/// Position a cursor at the last entry matching the prefix.
+pub fn position_cursor_at_prefix_end(
+    cursor: &mut RoCursor<'_>,
+    prefix: &[u8],
+) -> Result<bool, SearchnosDBError> {
+    // Start at the first key >= prefix; then walk forward to the last with the same prefix.
+    let positioned = match cursor.get(Some(prefix), None, MDB_SET_RANGE) {
+        Ok((Some(key), _)) => {
+            if key.starts_with(prefix) {
+                true
+            } else {
+                false
+            }
+        }
+        Ok((None, _)) | Err(lmdb::Error::NotFound) => false,
+        Err(err) => return Err(err.into()),
+    };
+
+    if !positioned {
+        return Ok(false);
+    }
+
+    loop {
+        match cursor.get(None, None, MDB_NEXT) {
+            Ok((Some(next_key), _)) => {
+                if !next_key.starts_with(prefix) {
+                    // Step back to the last matching entry.
+                    match cursor.get(None, None, MDB_PREV) {
+                        Ok((Some(prev_key), _)) => return Ok(prev_key.starts_with(prefix)),
+                        Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(false),
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+            }
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => {
+                // Already at last entry with the prefix.
+                return Ok(true);
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
 }
 
-/// Helper to put a value with NO_DUP_DATA flag, treating KeyExist as success
-pub fn put_no_dup<K, V>(
+/// Helper to insert a key->seq mapping, ignoring duplicates.
+pub fn put_keyed_seq<K>(
     db: Database,
     txn: &mut RwTransaction<'_>,
     key: &K,
-    value: &V,
+    seq: u64,
 ) -> Result<(), SearchnosDBError>
 where
     K: AsRef<[u8]>,
-    V: AsRef<[u8]>,
 {
-    match txn.put(db, key, value, WriteFlags::NO_DUP_DATA) {
+    let value = seq.to_ne_bytes();
+    match txn.put(db, key, &value, WriteFlags::NO_OVERWRITE) {
         Ok(()) | Err(lmdb::Error::KeyExist) => Ok(()),
         Err(err) => Err(err.into()),
     }

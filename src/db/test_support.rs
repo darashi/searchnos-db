@@ -4,9 +4,7 @@ use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, nor
 
 use super::{
     QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
-    index::{
-        KindsIndex, PubkeyIndex, PubkeyKindIndex, TagIndex, common::decode_created_at_seq_value,
-    },
+    index::common::{position_cursor_at_prefix_end, split_ts_seq_from_key},
     write::InsertResult,
 };
 
@@ -166,21 +164,14 @@ impl TestDatabase {
         txn: &RoTransaction<'_>,
         tag: char,
         value: &str,
-        created_at: u64,
+        _created_at: u64,
         seq: u64,
     ) -> bool {
-        let Some(key) = TagIndex::key(tag, value) else {
-            return false;
-        };
-        let expected = PubkeyIndex::encode_value(created_at, seq);
-        let mut cursor = txn
-            .open_ro_cursor(self.db.tag_index.database())
-            .expect("failed to open tag cursor");
-        match cursor.iter_dup_of(&key) {
-            Ok(mut iter) => iter.any(|(_, stored)| stored == expected),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected cursor error: {err}"),
-        }
+        self.db
+            .tag_index
+            .iter_candidates(txn, &[(tag, vec![value.to_string()])], None, None)
+            .expect("tag iterator failed")
+            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     pub(crate) fn assert_event_removed(&self, txn: &RoTransaction<'_>, seq: u64, event: &Event) {
@@ -310,20 +301,14 @@ impl TestDatabase {
         &self,
         txn: &RoTransaction<'_>,
         kind: u16,
-        created_at: u64,
+        _created_at: u64,
         seq: u64,
     ) -> bool {
-        let mut cursor = txn
-            .open_ro_cursor(self.db.kind_index.database())
-            .expect("failed to open kind cursor");
-        let key = KindsIndex::kind_key(kind);
-        let expected_value = PubkeyIndex::encode_value(created_at, seq);
-
-        match cursor.iter_dup_of(&key) {
-            Ok(mut iter) => iter.any(|(_, value)| value == expected_value),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected cursor error: {err}"),
-        }
+        self.db
+            .kind_index
+            .iter_candidates(txn, &[kind], None, None)
+            .expect("kind iterator failed")
+            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     pub(crate) fn pubkey_kind_contains(
@@ -331,20 +316,14 @@ impl TestDatabase {
         txn: &RoTransaction<'_>,
         pubkey: &PublicKey,
         kind: u16,
-        created_at: u64,
+        _created_at: u64,
         seq: u64,
     ) -> bool {
-        let mut cursor = txn
-            .open_ro_cursor(self.db.pubkey_kind_index.database())
-            .expect("failed to open pubkey_kind cursor");
-        let key = PubkeyKindIndex::key(pubkey.as_bytes(), kind);
-        let expected_value = PubkeyIndex::encode_value(created_at, seq);
-
-        match cursor.iter_dup_of(&key) {
-            Ok(mut iter) => iter.any(|(_, value)| value == expected_value),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected cursor error: {err}"),
-        }
+        self.db
+            .pubkey_kind_index
+            .iter_candidates(txn, &[pubkey.as_bytes()], &[kind], None, None)
+            .expect("pubkey_kind iterator failed")
+            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     fn ngram_contains(
@@ -357,36 +336,51 @@ impl TestDatabase {
         let mut cursor = txn
             .open_ro_cursor(self.db.ngram_index.database())
             .expect("failed to open ngram cursor");
-        let bytes = gram.as_bytes();
-        match cursor.iter_dup_of(&bytes) {
-            Ok(mut iter) => iter.any(|(_, value)| match decode_created_at_seq_value(value) {
-                Ok((stored_created_at, stored_seq_bytes)) => {
-                    stored_created_at == created_at && stored_seq_bytes == seq.to_ne_bytes()
-                }
-                Err(_) => false,
-            }),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected ngram cursor error: {err}"),
+        if !position_cursor_at_prefix_end(&mut cursor, gram.as_bytes())
+            .expect("ngram position failed")
+        {
+            return false;
         }
+
+        loop {
+            let (key_bytes, _) = cursor
+                .get(None, None, lmdb_sys::MDB_GET_CURRENT)
+                .expect("ngram cursor get failed");
+            let Some(key) = key_bytes else { break };
+
+            if !key.starts_with(gram.as_bytes()) {
+                break;
+            }
+
+            let Ok((stored_created_at, stored_seq)) = split_ts_seq_from_key(key) else {
+                return false;
+            };
+            if stored_created_at == created_at && stored_seq == seq.to_ne_bytes() {
+                return true;
+            }
+
+            match cursor.get(None, None, lmdb_sys::MDB_PREV) {
+                Ok(_) => continue,
+                Err(lmdb::Error::NotFound) => break,
+                Err(err) => panic!("unexpected ngram cursor error: {err}"),
+            }
+        }
+
+        false
     }
 
     fn author_contains(
         &self,
         txn: &RoTransaction<'_>,
         pubkey: &PublicKey,
-        created_at: u64,
+        _created_at: u64,
         seq: u64,
     ) -> bool {
-        let mut cursor = txn
-            .open_ro_cursor(self.db.pubkey_index.database())
-            .expect("failed to open pubkey cursor");
-        let target_value = PubkeyIndex::encode_value(created_at, seq);
-
-        match cursor.iter_dup_of(pubkey.as_bytes()) {
-            Ok(mut iter) => iter.any(|(_, value)| value == target_value),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected author cursor error: {err}"),
-        }
+        self.db
+            .pubkey_index
+            .iter_candidates(txn, &[pubkey.as_bytes()], None, None)
+            .expect("author iterator failed")
+            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     pub(crate) fn event_index_key(event_id: &EventId, pubkey: &PublicKey) -> Vec<u8> {

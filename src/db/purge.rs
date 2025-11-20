@@ -1,6 +1,12 @@
-use super::{PurgePolicy, SearchnosDB, SearchnosDBError, index::KindsIndex};
+use super::{
+    PurgePolicy, SearchnosDB, SearchnosDBError,
+    index::{
+        KindsIndex,
+        common::{position_cursor_at_prefix_end, split_ts_seq_from_key},
+    },
+};
 use lmdb::{Cursor, RwTransaction, Transaction};
-use lmdb_sys::{MDB_FIRST, MDB_NEXT_NODUP};
+use lmdb_sys::{MDB_FIRST, MDB_GET_CURRENT, MDB_NEXT_NODUP, MDB_PREV};
 use std::{
     cmp::Ordering,
     collections::HashSet,
@@ -229,27 +235,37 @@ impl SearchnosDB {
         let retention_secs = purge_after.as_secs();
         let cutoff = now.saturating_sub(retention_secs);
         let mut cursor = txn.open_ro_cursor(self.kind_index.database())?;
-        let key = KindsIndex::kind_key(kind);
+        let prefix = KindsIndex::kind_key(kind);
 
-        match cursor.iter_dup_of(&key) {
-            Ok(mut iter) => {
-                for (_key, value) in iter.by_ref() {
-                    let (created_at, seq_bytes) = KindsIndex::decode_value(value)?;
-                    if created_at <= cutoff {
-                        let seq = u64::from_ne_bytes(seq_bytes);
-                        if seen.insert(seq) {
-                            out.push((created_at, seq));
-                        }
-                        if out.len() >= max_events {
-                            break;
-                        }
-                    } else {
+        if position_cursor_at_prefix_end(&mut cursor, &prefix)? {
+            loop {
+                let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                    Ok((Some(key), value)) => (key, value),
+                    Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
+                };
+
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+
+                let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
+                if created_at <= cutoff {
+                    let seq = u64::from_ne_bytes(seq_bytes);
+                    if seen.insert(seq) {
+                        out.push((created_at, seq));
+                    }
+                    if out.len() >= max_events {
                         break;
                     }
                 }
+
+                match cursor.get(None, None, MDB_PREV) {
+                    Ok(_) => continue,
+                    Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
+                }
             }
-            Err(lmdb::Error::NotFound) => {}
-            Err(err) => return Err(err.into()),
         }
 
         Ok(())

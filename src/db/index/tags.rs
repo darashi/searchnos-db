@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
-use lmdb_sys::{MDB_GET_CURRENT, MDB_LAST_DUP, MDB_PREV_DUP, MDB_SET_KEY};
+use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 
-use super::common::{decode_created_at_seq_value, delete_dup_value, put_no_dup};
-use crate::db::{AUTHOR_INDEX_VALUE_BYTES, SEQ_BYTES, SearchnosDBError};
+use super::common::{
+    append_ts_seq, position_cursor_at_prefix_end, put_keyed_seq, split_ts_seq_from_key,
+};
+use crate::db::{SEQ_BYTES, SearchnosDBError};
 
 /// Index events by single-letter tag value.
 #[derive(Debug)]
@@ -50,12 +52,14 @@ impl TagIndex {
         &self,
         txn: &mut RwTransaction<'_>,
         key: &K,
-        value: &[u8; AUTHOR_INDEX_VALUE_BYTES],
+        created_at: u64,
+        seq: u64,
     ) -> Result<(), SearchnosDBError>
     where
         K: AsRef<[u8]>,
     {
-        put_no_dup(self.db, txn, key, value)
+        let entry_key = Self::entry_key(key, created_at, seq);
+        put_keyed_seq(self.db, txn, &entry_key, seq)
     }
 
     /// Remove a stored tuple for a tag entry.
@@ -63,13 +67,26 @@ impl TagIndex {
         &self,
         txn: &mut RwTransaction<'_>,
         key: &K,
-        value: &[u8; AUTHOR_INDEX_VALUE_BYTES],
+        created_at: u64,
+        seq: u64,
     ) -> Result<(), SearchnosDBError>
     where
         K: AsRef<[u8]>,
     {
-        let mut cursor = txn.open_rw_cursor(self.db)?;
-        delete_dup_value(&mut cursor, key.as_ref(), value)
+        let entry_key = Self::entry_key(key, created_at, seq);
+        match txn.del(self.db, &entry_key, None) {
+            Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn entry_key<K>(key: &K, created_at: u64, seq: u64) -> Vec<u8>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut buf = key.as_ref().to_vec();
+        append_ts_seq(&mut buf, created_at, seq);
+        buf
     }
 
     /// Iterate over all seq_bytes that match the given tag entries (OR within tag, AND across tags)
@@ -147,43 +164,51 @@ impl TagIndex {
         since: Option<u64>,
         until: Option<u64>,
     ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError> {
-        let cursor = txn.open_ro_cursor(self.db)?;
-        if cursor.get(Some(key), None, MDB_SET_KEY).is_err() {
-            return Ok(Vec::new());
-        }
-        if cursor.get(None, None, MDB_LAST_DUP).is_err() {
+        let mut cursor = txn.open_ro_cursor(self.db)?;
+        if !position_cursor_at_prefix_end(&mut cursor, key)? {
             return Ok(Vec::new());
         }
 
         let mut entries = Vec::new();
         loop {
-            let value_bytes = match cursor.get(None, None, MDB_GET_CURRENT) {
-                Ok((Some(current_key), value)) => {
-                    if current_key != key {
-                        break;
-                    }
-                    value
-                }
+            let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(current_key), value)) => (current_key, value),
                 Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
                 Err(err) => return Err(err.into()),
             };
 
-            let (created_at, seq_bytes) = decode_created_at_seq_value(value_bytes)?;
+            if !key_bytes.starts_with(key) {
+                break;
+            }
+
+            if key_bytes.len() != key.len() + super::common::TS_SEQ_BYTES {
+                match cursor.get(None, None, MDB_PREV) {
+                    Ok(_) => continue,
+                    Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+
+            let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
 
             if let Some(until_bound) = until
                 && created_at > until_bound
             {
-                // Skip newer entries until we reach within the until bound.
-            } else {
-                if let Some(since_bound) = since
-                    && created_at < since_bound
-                {
-                    break;
+                match cursor.get(None, None, MDB_PREV) {
+                    Ok(_) => continue,
+                    Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
                 }
-                entries.push((created_at, seq_bytes));
             }
 
-            match cursor.get(None, None, MDB_PREV_DUP) {
+            if let Some(since_bound) = since
+                && created_at < since_bound
+            {
+                break;
+            }
+            entries.push((created_at, seq_bytes));
+
+            match cursor.get(None, None, MDB_PREV) {
                 Ok(_) => continue,
                 Err(lmdb::Error::NotFound) => break,
                 Err(err) => return Err(err.into()),

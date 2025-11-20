@@ -56,7 +56,6 @@ const DEFAULT_MAP_SIZE: usize = 1usize << 40; // 1 TiB
 const SEQ_BYTES: usize = std::mem::size_of::<u64>();
 const CREATED_AT_BYTES: usize = std::mem::size_of::<u64>();
 const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
-const AUTHOR_INDEX_VALUE_BYTES: usize = std::mem::size_of::<u64>() + SEQ_BYTES;
 
 use index::{
     ContentsStore, CreatedAtIndex, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex,
@@ -121,8 +120,6 @@ pub enum SearchnosDBError {
     InvalidCreatedAtLength(usize),
     #[error("unexpected expiration length: expected {EXPIRATION_BYTES} bytes, got {0}")]
     InvalidExpirationLength(usize),
-    #[error("unexpected index value length: expected {AUTHOR_INDEX_VALUE_BYTES} bytes, got {0}")]
-    InvalidIndexValueLength(usize),
     #[error("normalized content is not valid UTF-8: {0}")]
     InvalidUtf8Content(#[from] std::str::Utf8Error),
     #[error("batch state is poisoned")]
@@ -380,9 +377,12 @@ impl SearchnosDB {
         let mut cursor = txn.open_ro_cursor(self.kind_index.database())?;
         let mut stats = BTreeMap::new();
 
-        for (key, value) in cursor.iter() {
-            let kind = KindsIndex::decode_key(key)?;
-            let (created_at, _) = KindsIndex::decode_value(value)?;
+        for (key, _) in cursor.iter() {
+            if key.len() < std::mem::size_of::<u16>() {
+                return Err(SearchnosDBError::InvalidKeyLength(key.len()));
+            }
+            let kind = KindsIndex::decode_key(&key[..std::mem::size_of::<u16>()])?;
+            let (created_at, _) = index::common::split_ts_seq_from_key(key)?;
             let entry = stats.entry(kind).or_insert(KindStats {
                 kind,
                 count: 0,

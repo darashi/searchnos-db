@@ -17,7 +17,6 @@ use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams};
 
 use super::{
     KEY_BYTES, SearchnosDB, SearchnosDBError,
-    index::PubkeyIndex,
     normalize::{EventIndexData, build_event_index_key, collect_tag_keys},
 };
 
@@ -295,24 +294,24 @@ impl SearchnosDB {
         expiration: Option<u64>,
     ) -> Result<(), SearchnosDBError> {
         let created_at = event.created_at.as_u64();
-        let index_value = PubkeyIndex::encode_value(created_at, seq);
 
         self.pubkey_index
-            .put(txn, event.pubkey.as_bytes(), &index_value)?;
+            .put(txn, event.pubkey.as_bytes(), created_at, seq)?;
         self.kind_index
-            .put(txn, event.kind.as_u16(), &index_value)?;
+            .put(txn, event.kind.as_u16(), created_at, seq)?;
         self.pubkey_kind_index.put(
             txn,
             event.pubkey.as_bytes(),
             event.kind.as_u16(),
-            &index_value,
+            created_at,
+            seq,
         )?;
         self.event_id_index
             .put(txn, &index_data.event_index_key, seq)?;
         self.created_at_index.put(txn, created_at, seq)?;
 
         for tag_key in &index_data.tag_keys {
-            self.tag_index.put(txn, tag_key, &index_value)?;
+            self.tag_index.put(txn, tag_key, created_at, seq)?;
         }
 
         if let Some(expiration_ts) = expiration {
@@ -494,19 +493,21 @@ impl SearchnosDB {
             }
         }
 
-        let author_value = PubkeyIndex::encode_value(event.created_at.as_u64(), seq);
+        let created_at = event.created_at.as_u64();
         self.pubkey_index
-            .delete_value(txn, event.pubkey.as_bytes(), &author_value)?;
+            .delete_value(txn, event.pubkey.as_bytes(), created_at, seq)?;
         self.kind_index
-            .delete_value(txn, event.kind.as_u16(), &author_value)?;
+            .delete_value(txn, event.kind.as_u16(), created_at, seq)?;
         self.pubkey_kind_index.delete_value(
             txn,
             event.pubkey.as_bytes(),
             event.kind.as_u16(),
-            &author_value,
+            created_at,
+            seq,
         )?;
         for tag_key in collect_tag_keys(&event) {
-            self.tag_index.delete_value(txn, &tag_key, &author_value)?;
+            self.tag_index
+                .delete_value(txn, &tag_key, created_at, seq)?;
         }
 
         if let Some(replacable_key) = Self::replacable_key(&event) {

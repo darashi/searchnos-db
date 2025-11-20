@@ -4,9 +4,11 @@ use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
     WriteFlags,
 };
-use lmdb_sys::MDB_GET_BOTH;
+use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 
-use super::common::{decode_created_at_seq_value, encode_created_at_seq_value};
+use super::common::{
+    TS_SEQ_BYTES, append_ts_seq, position_cursor_at_prefix_end, split_ts_seq_from_key,
+};
 use crate::db::{SEQ_BYTES, SearchnosDBError};
 use crate::text::{MAX_NGRAM_SIZE, char_ngrams, preferred_min_query_ngram_size};
 
@@ -127,8 +129,8 @@ impl NgramIndex {
     where
         G: AsRef<[u8]>,
     {
-        let value = encode_created_at_seq_value(created_at, seq);
-        match txn.put(self.db, gram, &value, WriteFlags::NO_DUP_DATA) {
+        let key = Self::key_with_suffix(gram, created_at, seq);
+        match txn.put(self.db, &key, &[], WriteFlags::NO_OVERWRITE) {
             Ok(()) | Err(lmdb::Error::KeyExist) => Ok(()),
             Err(err) => Err(err.into()),
         }
@@ -145,15 +147,9 @@ impl NgramIndex {
     where
         G: AsRef<[u8]>,
     {
-        let mut cursor = txn.open_rw_cursor(self.db)?;
-        let gram_bytes = gram.as_ref();
-        let value = encode_created_at_seq_value(created_at, seq);
-        match cursor.get(Some(gram_bytes), Some(&value), MDB_GET_BOTH) {
-            Ok(_) => match cursor.del(WriteFlags::CURRENT) {
-                Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
-                Err(err) => Err(err.into()),
-            },
-            Err(lmdb::Error::NotFound) => Ok(()),
+        let key = Self::key_with_suffix(gram, created_at, seq);
+        match txn.del(self.db, &key, None) {
+            Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
             Err(err) => Err(err.into()),
         }
     }
@@ -212,40 +208,83 @@ impl NgramIndex {
         until: Option<u64>,
     ) -> Result<Vec<PostingEntry>, SearchnosDBError> {
         let mut cursor = txn.open_ro_cursor(self.db)?;
-        let mut entries = Vec::new();
-
-        match cursor.iter_dup_of(&gram) {
-            Ok(mut iter) => {
-                for (_, value) in &mut iter {
-                    let (created_at, seq_bytes) = decode_created_at_seq_value(value)?;
-
-                    if let Some(until_bound) = until
-                        && created_at > until_bound
-                    {
-                        continue;
-                    }
-
-                    if let Some(since_bound) = since
-                        && created_at < since_bound
-                    {
-                        continue;
-                    }
-
-                    entries.push(PostingEntry {
-                        created_at,
-                        seq: seq_bytes,
-                    });
-                }
-            }
-            Err(lmdb::Error::NotFound) => {}
-            Err(err) => return Err(err.into()),
+        if !position_cursor_at_prefix_end(&mut cursor, gram)? {
+            return Ok(Vec::new());
         }
 
-        entries.sort_unstable_by(|a, b| match b.created_at.cmp(&a.created_at) {
-            std::cmp::Ordering::Equal => b.seq.cmp(&a.seq),
-            other => other,
-        });
+        let mut entries = Vec::new();
+
+        loop {
+            let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(key), value)) => (key, value),
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            };
+
+            if !key_bytes.starts_with(gram) {
+                break;
+            }
+
+            if key_bytes.len() != gram.len() + TS_SEQ_BYTES {
+                match cursor.get(None, None, MDB_PREV) {
+                    Ok(_) => continue,
+                    Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+
+            if !key_bytes.starts_with(gram) {
+                break;
+            }
+
+            let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
+
+            if let Some(until_bound) = until
+                && created_at > until_bound
+            {
+                match cursor.get(None, None, MDB_PREV) {
+                    Ok(_) => continue,
+                    Err(lmdb::Error::NotFound) => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+
+            if let Some(since_bound) = since
+                && created_at < since_bound
+            {
+                break;
+            }
+
+            entries.push(PostingEntry {
+                created_at,
+                seq: seq_bytes,
+            });
+
+            match cursor.get(None, None, MDB_PREV) {
+                Ok(_) => continue,
+                Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        if entries.len() > 1 {
+            entries.sort_unstable_by(|a, b| match b.created_at.cmp(&a.created_at) {
+                std::cmp::Ordering::Equal => b.seq.cmp(&a.seq),
+                other => other,
+            });
+        }
 
         Ok(entries)
+    }
+
+    fn key_with_suffix<G>(gram: &G, created_at: u64, seq: u64) -> Vec<u8>
+    where
+        G: AsRef<[u8]>,
+    {
+        let gram_bytes = gram.as_ref();
+        let mut key = Vec::with_capacity(gram_bytes.len() + TS_SEQ_BYTES);
+        key.extend_from_slice(gram_bytes);
+        append_ts_seq(&mut key, created_at, seq);
+        key
     }
 }
