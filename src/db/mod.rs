@@ -673,7 +673,7 @@ mod tests {
 
         let txn = db.ro_txn();
         db.assert_event_stored(&txn, original_seq, &original_event);
-        db.assert_no_deletion_marker(&txn, &original_event.id, &original_event.pubkey);
+        db.assert_no_deletion_marker(&txn, &original_event.id, &author_keys.public_key());
         db.assert_deletion_marker_eq(
             &txn,
             &original_event.id,
@@ -704,17 +704,12 @@ mod tests {
 
         let txn = db.ro_txn();
         db.assert_event_absent(&txn, &original_event);
-        db.assert_deletion_marker_eq(
-            &txn,
-            &original_event.id,
-            &original_event.pubkey,
-            deletion_seq,
-        );
+        db.assert_deletion_marker_eq(&txn, &original_event.id, &keys.public_key(), deletion_seq);
         db.assert_event_stored(&txn, deletion_seq, &deletion_event);
     }
 
     #[test]
-    fn deletion_from_other_author_still_blocks_late_insert() {
+    fn deletion_from_other_author_does_not_block_late_insert() {
         let db = TestDatabase::new();
         let original_keys = Keys::generate();
         let deleter_keys = Keys::generate();
@@ -735,6 +730,7 @@ mod tests {
 
         let txn = db.ro_txn();
         db.assert_event_stored(&txn, seq_after_late_insert, &original_event);
+        db.assert_no_deletion_marker(&txn, &original_event.id, &original_keys.public_key());
         db.assert_deletion_marker_eq(
             &txn,
             &original_event.id,
@@ -773,6 +769,39 @@ mod tests {
         db.assert_event_removed(&txn, second_seq, &second_event);
         db.assert_deletion_marker_eq(&txn, &first_event.id, &first_event.pubkey, deletion_seq);
         db.assert_deletion_marker_eq(&txn, &second_event.id, &second_event.pubkey, deletion_seq);
+        db.assert_event_stored(&txn, deletion_seq, &deletion_event);
+    }
+
+    #[test]
+    fn deletion_with_mixed_pubkeys_only_removes_matching_author() {
+        let db = TestDatabase::new();
+        let author_keys = Keys::generate();
+        let other_keys = Keys::generate();
+
+        let author_event = EventBuilder::text_note("author note")
+            .sign_with_keys(&author_keys)
+            .expect("failed to build author event");
+        let author_seq = db.insert(&author_event);
+        assert_eq!(author_seq, 0);
+
+        let other_event = EventBuilder::text_note("other note")
+            .sign_with_keys(&other_keys)
+            .expect("failed to build other event");
+        let other_seq = db.insert(&other_event);
+        assert_eq!(other_seq, 1);
+
+        let deletion_request = EventDeletionRequest::new().ids([author_event.id, other_event.id]);
+        let deletion_event = EventBuilder::delete(deletion_request)
+            .sign_with_keys(&author_keys)
+            .expect("failed to build deletion event");
+        let deletion_seq = db.insert(&deletion_event);
+        assert_eq!(deletion_seq, 2);
+
+        let txn = db.ro_txn();
+        db.assert_event_removed(&txn, author_seq, &author_event);
+        db.assert_event_stored(&txn, other_seq, &other_event);
+        db.assert_deletion_marker_eq(&txn, &author_event.id, &author_event.pubkey, deletion_seq);
+        db.assert_no_deletion_marker(&txn, &other_event.id, &other_event.pubkey);
         db.assert_event_stored(&txn, deletion_seq, &deletion_event);
     }
 

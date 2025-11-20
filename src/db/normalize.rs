@@ -7,6 +7,7 @@ use super::index::TagIndex;
 #[derive(Debug, Clone)]
 pub(super) struct EventIndexData {
     pub event_index_key: Vec<u8>,
+    pub created_at: u64,
     pub normalized_content: Vec<u8>,
     pub ngrams: Vec<Vec<u8>>,
     pub tag_keys: Vec<Vec<u8>>,
@@ -16,12 +17,14 @@ pub(super) struct EventIndexData {
 impl EventIndexData {
     pub(super) fn from_event(event: &Event) -> Self {
         let event_index_key = build_event_index_key(event);
+        let created_at = event.created_at.as_u64();
         let (normalized_content, ngrams) = normalize_and_extract_ngrams(event);
         let tag_keys = collect_tag_keys(event);
         let expiration = extract_event_expiration(event);
 
         Self {
             event_index_key,
+            created_at,
             normalized_content: normalized_content.into_bytes(),
             ngrams,
             tag_keys,
@@ -30,10 +33,10 @@ impl EventIndexData {
     }
 }
 
-/// Build event index key from event ID and pubkey
+/// Build event index key from event ID and created_at
 pub(super) fn build_event_index_key(event: &Event) -> Vec<u8> {
     let mut key = event.id.as_bytes().to_vec();
-    key.extend_from_slice(event.pubkey.as_bytes());
+    key.extend_from_slice(&event.created_at.as_u64().to_be_bytes());
     key
 }
 

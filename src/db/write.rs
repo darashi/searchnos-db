@@ -10,13 +10,13 @@ use lmdb_sys::{MDB_GET_BOTH, MDB_LAST};
 use ndb::{NdbNote, from_ndb_note, to_ndb_note};
 
 use crate::nostr::{
-    Event, EventId, JsonUtil, Kind, TagExt, TagKind, Timestamp, extract_event_expiration,
+    Event, EventId, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp, extract_event_expiration,
 };
 
 use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams};
 
 use super::{
-    KEY_BYTES, SearchnosDB, SearchnosDBError,
+    KEY_BYTES, SEQ_BYTES, SearchnosDB, SearchnosDBError,
     normalize::{EventIndexData, build_event_index_key, collect_tag_keys},
 };
 
@@ -24,7 +24,7 @@ use super::{
 pub struct PreparedInsert {
     event: Event,
     index_data: EventIndexData,
-    deletion_keys: Vec<Vec<u8>>,
+    deletion_ids: Vec<EventId>,
     note_bytes: Vec<u8>,
     expiration: Option<u64>,
 }
@@ -70,8 +70,8 @@ impl SearchnosDB {
         let index_data = EventIndexData::from_event(&event);
         let expiration = index_data.expiration;
         let is_deletion = event.kind == Kind::EventDeletion;
-        let deletion_keys = if is_deletion {
-            Self::collect_deletion_keys(&event)
+        let deletion_ids = if is_deletion {
+            Self::collect_deletion_ids(&event)
         } else {
             Vec::new()
         };
@@ -80,7 +80,7 @@ impl SearchnosDB {
         Ok(PreparedInsert {
             event,
             index_data,
-            deletion_keys,
+            deletion_ids,
             note_bytes,
             expiration,
         })
@@ -144,7 +144,7 @@ impl SearchnosDB {
         }
 
         if prepared.event.kind == Kind::EventDeletion {
-            self.handle_deletion_event(txn, &prepared.deletion_keys, seq)?;
+            self.handle_deletion_event(txn, &prepared.event.pubkey, &prepared.deletion_ids, seq)?;
         }
 
         let note =
@@ -186,10 +186,11 @@ impl SearchnosDB {
         let event_index_key = build_event_index_key(event);
         let is_deletion = event.kind == Kind::EventDeletion;
 
-        if !is_deletion
-            && let Some(existing_seq) = self.deletions.get_marker(txn, &event_index_key)?
-        {
-            return Ok(ExistingEventResult::AlreadyExists(existing_seq));
+        if !is_deletion {
+            let deletion_key = Self::deletion_marker_key(&event.id, &event.pubkey);
+            if let Some(existing_seq) = self.deletions.get_marker(txn, &deletion_key)? {
+                return Ok(ExistingEventResult::AlreadyExists(existing_seq));
+            }
         }
 
         if let Some(existing_seq) = self.event_id_index.get_seq(txn, &event_index_key)? {
@@ -252,13 +253,7 @@ impl SearchnosDB {
         prepared: &PreparedInsert,
     ) -> Result<u64, SearchnosDBError> {
         let seq = self.next_seq(txn)?;
-        self.insert_event_data(
-            txn,
-            seq,
-            event.created_at.as_u64(),
-            &prepared.note_bytes,
-            &prepared.index_data,
-        )?;
+        self.insert_event_data(txn, seq, &prepared.note_bytes, &prepared.index_data)?;
         self.update_indexes(txn, seq, event, &prepared.index_data, prepared.expiration)?;
         Ok(seq)
     }
@@ -268,7 +263,6 @@ impl SearchnosDB {
         &self,
         txn: &mut RwTransaction<'env>,
         seq: u64,
-        created_at: u64,
         note_bytes: &[u8],
         index_data: &EventIndexData,
     ) -> Result<(), SearchnosDBError> {
@@ -277,6 +271,7 @@ impl SearchnosDB {
         self.contents
             .put(txn, &key_bytes, &index_data.normalized_content)?;
 
+        let created_at = index_data.created_at;
         for gram in &index_data.ngrams {
             self.ngram_index.put(txn, gram, created_at, seq)?;
         }
@@ -293,7 +288,7 @@ impl SearchnosDB {
         index_data: &EventIndexData,
         expiration: Option<u64>,
     ) -> Result<(), SearchnosDBError> {
-        let created_at = event.created_at.as_u64();
+        let created_at = index_data.created_at;
 
         self.pubkey_index
             .put(txn, event.pubkey.as_bytes(), created_at, seq)?;
@@ -325,10 +320,11 @@ impl SearchnosDB {
     fn handle_deletion_event<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
-        deletion_keys: &[Vec<u8>],
+        pubkey: &PublicKey,
+        deletion_ids: &[EventId],
         seq: u64,
     ) -> Result<(), SearchnosDBError> {
-        self.apply_deletions(txn, deletion_keys, seq)
+        self.apply_deletions(txn, pubkey, deletion_ids, seq)
     }
 
     fn next_seq<'env>(&self, txn: &mut RwTransaction<'env>) -> Result<u64, SearchnosDBError> {
@@ -385,8 +381,8 @@ impl SearchnosDB {
         Some(key)
     }
 
-    pub(crate) fn collect_deletion_keys(event: &Event) -> Vec<Vec<u8>> {
-        let mut keys = Vec::new();
+    pub(crate) fn collect_deletion_ids(event: &Event) -> Vec<EventId> {
+        let mut ids = Vec::new();
         for tag in event.tags.iter() {
             let TagKind::SingleLetter(single) = tag.kind() else {
                 continue;
@@ -400,29 +396,53 @@ impl SearchnosDB {
             let Ok(event_id) = EventId::from_str(content) else {
                 continue;
             };
-            let mut key =
-                Vec::with_capacity(event_id.as_bytes().len() + event.pubkey.as_bytes().len());
-            key.extend_from_slice(event_id.as_bytes());
-            key.extend_from_slice(event.pubkey.as_bytes());
-            keys.push(key);
+            ids.push(event_id);
         }
-        keys
+        ids
+    }
+
+    fn deletion_marker_key(event_id: &EventId, pubkey: &PublicKey) -> Vec<u8> {
+        let mut key = Vec::with_capacity(event_id.as_bytes().len() + pubkey.as_bytes().len());
+        key.extend_from_slice(event_id.as_bytes());
+        key.extend_from_slice(pubkey.as_bytes());
+        key
     }
 
     fn apply_deletions<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
-        deletion_keys: &[Vec<u8>],
+        pubkey: &PublicKey,
+        deletion_ids: &[EventId],
         deletion_seq: u64,
     ) -> Result<(), SearchnosDBError> {
-        if deletion_keys.is_empty() {
+        if deletion_ids.is_empty() {
             return Ok(());
         }
 
-        for key in deletion_keys {
-            self.deletions.put_marker(txn, key, deletion_seq)?;
+        for event_id in deletion_ids {
+            let id_bytes = event_id.as_bytes();
+            let marker_key = Self::deletion_marker_key(event_id, pubkey);
+            self.deletions.put_marker(txn, &marker_key, deletion_seq)?;
 
-            if let Some(event_seq) = self.event_id_index.get_seq(txn, key)? {
+            let id_refs: [&[u8]; 1] = [id_bytes];
+            let seqs: Vec<[u8; SEQ_BYTES]> = self
+                .event_id_index
+                .iter_candidates(txn, &id_refs)?
+                .collect();
+            for seq_bytes in seqs {
+                let event_seq = u64::from_ne_bytes(seq_bytes);
+                let event_key = event_seq.to_ne_bytes();
+                let event_bytes = match txn.get(self.events, &event_key) {
+                    Ok(bytes) => bytes,
+                    Err(lmdb::Error::NotFound) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                let event_json =
+                    from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+                let event = Event::from_json(&event_json)?;
+                if event.pubkey != *pubkey {
+                    continue;
+                }
                 self.remove_event_by_seq(txn, event_seq)?;
             }
         }
@@ -469,12 +489,14 @@ impl SearchnosDB {
 
         if remove_deletion_markers {
             if event.kind == Kind::EventDeletion {
-                for key in Self::collect_deletion_keys(&event) {
+                for id in Self::collect_deletion_ids(&event) {
+                    let key = Self::deletion_marker_key(&id, &event.pubkey);
                     self.deletions.delete_marker(txn, &key)?;
                 }
             }
 
-            self.deletions.delete_marker(txn, &event_index_key)?;
+            let key = Self::deletion_marker_key(&event.id, &event.pubkey);
+            self.deletions.delete_marker(txn, &key)?;
         }
 
         self.event_id_index.delete(txn, &event_index_key)?;

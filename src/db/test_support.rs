@@ -104,7 +104,7 @@ impl TestDatabase {
         let extracted_content = extract_text(event);
         assert_eq!(stored_content, normalize_text(&extracted_content));
 
-        let index_key = Self::event_index_key(&event.id, &event.pubkey);
+        let index_key = Self::event_index_key(&event.id, event.created_at.as_u64());
         let index_seq = txn
             .get(self.db.event_id_index.database(), &index_key)
             .expect("event id index missing");
@@ -176,7 +176,7 @@ impl TestDatabase {
 
     pub(crate) fn assert_event_removed(&self, txn: &RoTransaction<'_>, seq: u64, event: &Event) {
         let seq_bytes = seq.to_ne_bytes();
-        let index_key = Self::event_index_key(&event.id, &event.pubkey);
+        let index_key = Self::event_index_key(&event.id, event.created_at.as_u64());
 
         assert!(matches!(
             txn.get(self.db.events, &seq_bytes),
@@ -247,7 +247,7 @@ impl TestDatabase {
         pubkey: &PublicKey,
         expected_seq: u64,
     ) {
-        let key = Self::event_index_key(event_id, pubkey);
+        let key = Self::deletion_marker_key(event_id, pubkey);
         let marker = txn
             .get(self.db.deletions.database(), &key)
             .expect("deletion marker missing");
@@ -257,13 +257,14 @@ impl TestDatabase {
         assert_eq!(marker_bytes, expected_seq.to_ne_bytes());
     }
 
+    #[allow(dead_code)]
     pub(crate) fn assert_no_deletion_marker(
         &self,
         txn: &RoTransaction<'_>,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) {
-        let key = Self::event_index_key(event_id, pubkey);
+        let key = Self::deletion_marker_key(event_id, pubkey);
         assert!(matches!(
             txn.get(self.db.deletions.database(), &key),
             Err(lmdb::Error::NotFound)
@@ -271,7 +272,7 @@ impl TestDatabase {
     }
 
     pub(crate) fn assert_event_absent(&self, txn: &RoTransaction<'_>, event: &Event) {
-        let index_key = Self::event_index_key(&event.id, &event.pubkey);
+        let index_key = Self::event_index_key(&event.id, event.created_at.as_u64());
         assert!(matches!(
             txn.get(self.db.event_id_index.database(), &index_key),
             Err(lmdb::Error::NotFound)
@@ -383,7 +384,13 @@ impl TestDatabase {
             .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
-    pub(crate) fn event_index_key(event_id: &EventId, pubkey: &PublicKey) -> Vec<u8> {
+    pub(crate) fn event_index_key(event_id: &EventId, created_at: u64) -> Vec<u8> {
+        let mut key = event_id.as_bytes().to_vec();
+        key.extend_from_slice(&created_at.to_be_bytes());
+        key
+    }
+
+    fn deletion_marker_key(event_id: &EventId, pubkey: &PublicKey) -> Vec<u8> {
         let mut key = event_id.as_bytes().to_vec();
         key.extend_from_slice(pubkey.as_bytes());
         key

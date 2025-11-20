@@ -1,9 +1,6 @@
 use std::convert::TryInto;
 
-use lmdb::{
-    Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
-    WriteFlags,
-};
+use lmdb::{Cursor, Database, DatabaseFlags, Environment, RwTransaction, Transaction, WriteFlags};
 use lmdb_sys::{MDB_NEXT, MDB_SET_RANGE};
 
 use crate::db::{SEQ_BYTES, SearchnosDBError};
@@ -72,11 +69,14 @@ impl EventIdIndex {
     }
 
     /// Iterate over all seq_bytes that match the given event IDs (prefix match)
-    pub fn iter_candidates<'env>(
+    pub fn iter_candidates<'txn, T>(
         &self,
-        txn: &'env RoTransaction<'env>,
+        txn: &'txn T,
         ids: &[&[u8]],
-    ) -> Result<impl Iterator<Item = [u8; SEQ_BYTES]> + 'env, SearchnosDBError> {
+    ) -> Result<impl Iterator<Item = [u8; SEQ_BYTES]> + 'txn, SearchnosDBError>
+    where
+        T: Transaction,
+    {
         if ids.is_empty() {
             return Ok(Vec::new().into_iter());
         }

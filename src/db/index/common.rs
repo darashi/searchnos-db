@@ -32,13 +32,7 @@ pub fn position_cursor_at_prefix_end(
 ) -> Result<bool, SearchnosDBError> {
     // Start at the first key >= prefix; then walk forward to the last with the same prefix.
     let positioned = match cursor.get(Some(prefix), None, MDB_SET_RANGE) {
-        Ok((Some(key), _)) => {
-            if key.starts_with(prefix) {
-                true
-            } else {
-                false
-            }
-        }
+        Ok((Some(key), _)) => key.starts_with(prefix),
         Ok((None, _)) | Err(lmdb::Error::NotFound) => false,
         Err(err) => return Err(err.into()),
     };
