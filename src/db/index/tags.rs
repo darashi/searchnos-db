@@ -3,13 +3,15 @@ use std::collections::HashMap;
 
 use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
+    WriteFlags,
 };
 use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 
 use super::common::{
-    append_ts_seq, position_cursor_at_prefix_end, put_keyed_seq, split_ts_seq_from_key,
+    append_created_at, position_cursor_at_prefix_end, put_keyed_seq, seq_from_value,
+    split_created_at_from_key,
 };
-use crate::db::{SEQ_BYTES, SearchnosDBError};
+use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
 /// Index events by single-letter tag value.
 #[derive(Debug)]
@@ -58,7 +60,7 @@ impl TagIndex {
     where
         K: AsRef<[u8]>,
     {
-        let entry_key = Self::entry_key(key, created_at, seq);
+        let entry_key = Self::entry_key(key, created_at);
         put_keyed_seq(self.db, txn, &entry_key, seq)
     }
 
@@ -73,19 +75,25 @@ impl TagIndex {
     where
         K: AsRef<[u8]>,
     {
-        let entry_key = Self::entry_key(key, created_at, seq);
-        match txn.del(self.db, &entry_key, None) {
-            Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
+        let entry_key = Self::entry_key(key, created_at);
+        let value = seq.to_ne_bytes();
+        let mut cursor = txn.open_rw_cursor(self.db)?;
+        match cursor.get(Some(&entry_key), Some(&value), lmdb_sys::MDB_GET_BOTH) {
+            Ok(_) => match cursor.del(WriteFlags::CURRENT) {
+                Ok(()) | Err(lmdb::Error::NotFound) => Ok(()),
+                Err(err) => Err(err.into()),
+            },
+            Err(lmdb::Error::NotFound) => Ok(()),
             Err(err) => Err(err.into()),
         }
     }
 
-    fn entry_key<K>(key: &K, created_at: u64, seq: u64) -> Vec<u8>
+    fn entry_key<K>(key: &K, created_at: u64) -> Vec<u8>
     where
         K: AsRef<[u8]>,
     {
         let mut buf = key.as_ref().to_vec();
-        append_ts_seq(&mut buf, created_at, seq);
+        append_created_at(&mut buf, created_at);
         buf
     }
 
@@ -171,7 +179,7 @@ impl TagIndex {
 
         let mut entries = Vec::new();
         loop {
-            let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
+            let (key_bytes, value_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
                 Ok((Some(current_key), value)) => (current_key, value),
                 Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
                 Err(err) => return Err(err.into()),
@@ -181,7 +189,7 @@ impl TagIndex {
                 break;
             }
 
-            if key_bytes.len() != key.len() + super::common::TS_SEQ_BYTES {
+            if key_bytes.len() != key.len() + CREATED_AT_BYTES {
                 match cursor.get(None, None, MDB_PREV) {
                     Ok(_) => continue,
                     Err(lmdb::Error::NotFound) => break,
@@ -189,7 +197,8 @@ impl TagIndex {
                 }
             }
 
-            let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
+            let created_at = split_created_at_from_key(key_bytes)?;
+            let seq_bytes = seq_from_value(value_bytes)?;
 
             if let Some(until_bound) = until
                 && created_at > until_bound

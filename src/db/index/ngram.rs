@@ -129,11 +129,24 @@ impl NgramIndex {
     where
         G: AsRef<[u8]>,
     {
-        let key = Self::key_with_suffix(gram, created_at, seq);
+        let key = Self::key_with_suffix(&gram, created_at, seq);
         match txn.put(self.db, &key, &[], WriteFlags::NO_OVERWRITE) {
             Ok(()) | Err(lmdb::Error::KeyExist) => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Check whether an n-gram mapping exists for (gram, created_at, seq).
+    #[allow(dead_code)]
+    pub fn contains(
+        &self,
+        txn: &RoTransaction<'_>,
+        gram: impl AsRef<[u8]>,
+        created_at: u64,
+        seq: u64,
+    ) -> bool {
+        let key = Self::key_with_suffix(&gram, created_at, seq);
+        txn.get(self.db, &key).is_ok()
     }
 
     /// Remove a specific n-gram mapping for an event.

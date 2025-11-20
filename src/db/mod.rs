@@ -382,7 +382,7 @@ impl SearchnosDB {
                 return Err(SearchnosDBError::InvalidKeyLength(key.len()));
             }
             let kind = KindsIndex::decode_key(&key[..std::mem::size_of::<u16>()])?;
-            let (created_at, _) = index::common::split_ts_seq_from_key(key)?;
+            let created_at = index::common::split_created_at_from_key(key)?;
             let entry = stats.entry(kind).or_insert(KindStats {
                 kind,
                 count: 0,

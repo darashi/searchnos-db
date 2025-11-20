@@ -2,7 +2,7 @@ use super::{
     PurgePolicy, SearchnosDB, SearchnosDBError,
     index::{
         KindsIndex,
-        common::{position_cursor_at_prefix_end, split_ts_seq_from_key},
+        common::{position_cursor_at_prefix_end, seq_from_value, split_created_at_from_key},
     },
 };
 use lmdb::{Cursor, RwTransaction, Transaction};
@@ -239,7 +239,7 @@ impl SearchnosDB {
 
         if position_cursor_at_prefix_end(&mut cursor, &prefix)? {
             loop {
-                let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                let (key_bytes, value_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
                     Ok((Some(key), value)) => (key, value),
                     Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
                     Err(err) => return Err(err.into()),
@@ -249,7 +249,8 @@ impl SearchnosDB {
                     break;
                 }
 
-                let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
+                let created_at = split_created_at_from_key(key_bytes)?;
+                let seq_bytes = seq_from_value(value_bytes)?;
                 if created_at <= cutoff {
                     let seq = u64::from_ne_bytes(seq_bytes);
                     if seen.insert(seq) {

@@ -5,10 +5,25 @@ use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
 pub const TS_SEQ_BYTES: usize = CREATED_AT_BYTES + SEQ_BYTES;
 
+/// Append created_at (big-endian) to the provided key buffer.
+pub fn append_created_at(key: &mut Vec<u8>, created_at: u64) {
+    key.extend_from_slice(&created_at.to_be_bytes());
+}
+
 /// Append created_at/seq suffix (big-endian) to the provided key buffer.
 pub fn append_ts_seq(key: &mut Vec<u8>, created_at: u64, seq: u64) {
     key.extend_from_slice(&created_at.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
+}
+
+/// Extract created_at suffix from a key.
+pub fn split_created_at_from_key(key: &[u8]) -> Result<u64, SearchnosDBError> {
+    if key.len() < CREATED_AT_BYTES {
+        return Err(SearchnosDBError::InvalidKeyLength(key.len()));
+    }
+    let mut created_at_bytes = [0u8; CREATED_AT_BYTES];
+    created_at_bytes.copy_from_slice(&key[key.len() - CREATED_AT_BYTES..]);
+    Ok(u64::from_be_bytes(created_at_bytes))
 }
 
 /// Extract created_at and seq suffix from a key.
@@ -62,7 +77,18 @@ pub fn position_cursor_at_prefix_end(
     }
 }
 
-/// Helper to insert a key->seq mapping, ignoring duplicates.
+/// Decode a stored sequence number from a value buffer.
+pub fn seq_from_value(value: &[u8]) -> Result<[u8; SEQ_BYTES], SearchnosDBError> {
+    let mut seq_bytes = [0u8; SEQ_BYTES];
+    seq_bytes.copy_from_slice(
+        value
+            .get(..SEQ_BYTES)
+            .ok_or_else(|| SearchnosDBError::InvalidSeqLength(value.len()))?,
+    );
+    Ok(seq_bytes)
+}
+
+/// Helper to insert a key->seq mapping, allowing duplicates.
 pub fn put_keyed_seq<K>(
     db: Database,
     txn: &mut RwTransaction<'_>,
@@ -73,8 +99,6 @@ where
     K: AsRef<[u8]>,
 {
     let value = seq.to_ne_bytes();
-    match txn.put(db, key, &value, WriteFlags::NO_OVERWRITE) {
-        Ok(()) | Err(lmdb::Error::KeyExist) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    txn.put(db, key, &value, WriteFlags::empty())
+        .map_err(SearchnosDBError::from)
 }

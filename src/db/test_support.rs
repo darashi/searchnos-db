@@ -3,9 +3,7 @@ use std::convert::TryInto;
 use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, normalize_text};
 
 use super::{
-    QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
-    index::common::{position_cursor_at_prefix_end, split_ts_seq_from_key},
-    write::InsertResult,
+    QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription, write::InsertResult,
 };
 
 use crate::nostr::{
@@ -334,40 +332,7 @@ impl TestDatabase {
         created_at: u64,
         seq: u64,
     ) -> bool {
-        let mut cursor = txn
-            .open_ro_cursor(self.db.ngram_index.database())
-            .expect("failed to open ngram cursor");
-        if !position_cursor_at_prefix_end(&mut cursor, gram.as_bytes())
-            .expect("ngram position failed")
-        {
-            return false;
-        }
-
-        loop {
-            let (key_bytes, _) = cursor
-                .get(None, None, lmdb_sys::MDB_GET_CURRENT)
-                .expect("ngram cursor get failed");
-            let Some(key) = key_bytes else { break };
-
-            if !key.starts_with(gram.as_bytes()) {
-                break;
-            }
-
-            let Ok((stored_created_at, stored_seq)) = split_ts_seq_from_key(key) else {
-                return false;
-            };
-            if stored_created_at == created_at && stored_seq == seq.to_ne_bytes() {
-                return true;
-            }
-
-            match cursor.get(None, None, lmdb_sys::MDB_PREV) {
-                Ok(_) => continue,
-                Err(lmdb::Error::NotFound) => break,
-                Err(err) => panic!("unexpected ngram cursor error: {err}"),
-            }
-        }
-
-        false
+        self.db.ngram_index.contains(txn, gram, created_at, seq)
     }
 
     fn author_contains(
