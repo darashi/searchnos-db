@@ -48,7 +48,7 @@ Reads newline-delimited JSON and inserts events with a progress bar. Multiple fi
 
 ### Query events
 ```bash
-cargo run -- query --filters '{"authors": ["<hex pubkey>"], "kinds": [1]}'
+cargo run -- query '{"authors": ["<hex pubkey>"], "kinds": [1]}'
 ```
 Provide a JSON object for one filter or a JSON array for multiple filters. The `search` field follows NIP-50 semantics. Matching events are printed as JSON on stdout, and execution time is logged to stderr.
 
