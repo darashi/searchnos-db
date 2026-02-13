@@ -60,7 +60,9 @@ impl TestDatabase {
     }
 
     pub(crate) fn purge_with_time(&self, limit: usize, now: u64) -> usize {
-        self.db.purge_internal(limit, now).expect("purge failed")
+        self.db
+            .purge_internal(limit, now, None, None)
+            .expect("purge failed")
     }
 
     pub(crate) fn query(&self, filters: &[Filter]) -> Vec<String> {

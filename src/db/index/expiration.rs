@@ -71,20 +71,29 @@ impl ExpirationIndex {
         Ok(u64::from_ne_bytes(expiration_bytes))
     }
 
-    /// Collect expired entries whose timestamp is not greater than `now`.
+    /// Collect up to `limit` expired entries whose timestamp is not greater than `now`.
     pub fn collect_expired<T>(
         &self,
         txn: &T,
         now: u64,
+        limit: usize,
     ) -> Result<Vec<(u64, [u8; SEQ_BYTES])>, SearchnosDBError>
     where
         T: Transaction,
     {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let cursor = txn.open_ro_cursor(self.db)?;
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(limit);
         let mut entry = cursor.get(None, None, MDB_FIRST);
 
         while let Ok((Some(key_bytes), value_bytes)) = entry {
+            if results.len() >= limit {
+                break;
+            }
+
             let expiration = Self::expiration_from_bytes(key_bytes)?;
             if expiration > now {
                 break;
