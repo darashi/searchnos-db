@@ -1,5 +1,5 @@
 use lmdb::{Cursor, Database, RoCursor, RwTransaction, WriteFlags};
-use lmdb_sys::{MDB_NEXT, MDB_PREV, MDB_SET_RANGE};
+use lmdb_sys::{MDB_LAST, MDB_PREV, MDB_SET_RANGE};
 
 use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
@@ -45,7 +45,6 @@ pub fn position_cursor_at_prefix_end(
     cursor: &mut RoCursor<'_>,
     prefix: &[u8],
 ) -> Result<bool, SearchnosDBError> {
-    // Start at the first key >= prefix; then walk forward to the last with the same prefix.
     let positioned = match cursor.get(Some(prefix), None, MDB_SET_RANGE) {
         Ok((Some(key), _)) => key.starts_with(prefix),
         Ok((None, _)) | Err(lmdb::Error::NotFound) => false,
@@ -56,25 +55,40 @@ pub fn position_cursor_at_prefix_end(
         return Ok(false);
     }
 
-    loop {
-        match cursor.get(None, None, MDB_NEXT) {
-            Ok((Some(next_key), _)) => {
-                if !next_key.starts_with(prefix) {
-                    // Step back to the last matching entry.
-                    match cursor.get(None, None, MDB_PREV) {
-                        Ok((Some(prev_key), _)) => return Ok(prev_key.starts_with(prefix)),
-                        Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(false),
-                        Err(err) => return Err(err.into()),
-                    }
-                }
-            }
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => {
-                // Already at last entry with the prefix.
-                return Ok(true);
-            }
-            Err(err) => return Err(err.into()),
-        }
+    let Some(next_prefix) = next_lexicographic_key(prefix) else {
+        return match cursor.get(None, None, MDB_LAST) {
+            Ok((Some(key), _)) => Ok(key.starts_with(prefix)),
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err.into()),
+        };
+    };
+
+    match cursor.get(Some(&next_prefix), None, MDB_SET_RANGE) {
+        Ok(_) => match cursor.get(None, None, MDB_PREV) {
+            Ok((Some(prev_key), _)) => Ok(prev_key.starts_with(prefix)),
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err.into()),
+        },
+        Err(lmdb::Error::NotFound) => match cursor.get(None, None, MDB_LAST) {
+            Ok((Some(last_key), _)) => Ok(last_key.starts_with(prefix)),
+            Ok((None, _)) | Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err.into()),
+        },
+        Err(err) => Err(err.into()),
     }
+}
+
+fn next_lexicographic_key(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut key = prefix.to_vec();
+    for idx in (0..key.len()).rev() {
+        if key[idx] == u8::MAX {
+            continue;
+        }
+        key[idx] += 1;
+        key.truncate(idx + 1);
+        return Some(key);
+    }
+    None
 }
 
 /// Decode a stored sequence number from a value buffer.

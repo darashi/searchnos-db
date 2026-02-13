@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use lmdb::{
-    Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
-    WriteFlags,
+    Cursor, Database, DatabaseFlags, Environment, RoCursor, RoTransaction, RwTransaction,
+    Transaction, WriteFlags,
 };
 use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 
@@ -12,6 +12,8 @@ use super::common::{
 use crate::db::{SEQ_BYTES, SearchnosDBError};
 use crate::text::{MAX_NGRAM_SIZE, char_ngrams, preferred_min_query_ngram_size};
 
+const USE_REPRESENTATIVE_QUERY_GRAMS: bool = true;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PostingEntry {
     created_at: u64,
@@ -19,46 +21,139 @@ struct PostingEntry {
 }
 
 #[derive(Debug)]
-struct PostingCursor {
-    entries: Vec<PostingEntry>,
-    index: usize,
+struct PostingCursor<'txn> {
+    cursor: RoCursor<'txn>,
+    gram: Vec<u8>,
+    since: Option<u64>,
+    until: Option<u64>,
+    current: Option<PostingEntry>,
+    finished: bool,
 }
 
-impl PostingCursor {
-    fn new(entries: Vec<PostingEntry>) -> Self {
-        Self { entries, index: 0 }
+impl<'txn> PostingCursor<'txn> {
+    fn open(
+        txn: &'txn RoTransaction<'txn>,
+        db: Database,
+        gram: Vec<u8>,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Result<Self, SearchnosDBError> {
+        let cursor = txn.open_ro_cursor(db)?;
+        let mut posting = Self {
+            cursor,
+            gram,
+            since,
+            until,
+            current: None,
+            finished: false,
+        };
+        if !position_cursor_at_prefix_end(&mut posting.cursor, &posting.gram)? {
+            posting.finished = true;
+            return Ok(posting);
+        }
+        posting.current = posting.refresh_current()?;
+        Ok(posting)
     }
 
     fn current(&self) -> Option<PostingEntry> {
-        self.entries.get(self.index).copied()
+        self.current
     }
 
-    fn advance(&mut self) {
-        if self.index + 1 < self.entries.len() {
-            self.index += 1;
-        } else {
-            self.index = self.entries.len();
+    fn advance(&mut self) -> Result<(), SearchnosDBError> {
+        if self.finished {
+            return Ok(());
+        }
+
+        if !self.move_prev()? {
+            self.finished = true;
+            self.current = None;
+            return Ok(());
+        }
+
+        self.current = self.refresh_current()?;
+        Ok(())
+    }
+
+    fn refresh_current(&mut self) -> Result<Option<PostingEntry>, SearchnosDBError> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        loop {
+            let (key_bytes, _) = match self.cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(key), value)) => (key, value),
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            if !key_bytes.starts_with(&self.gram) {
+                self.finished = true;
+                return Ok(None);
+            }
+
+            if key_bytes.len() != self.gram.len() + TS_SEQ_BYTES {
+                if !self.move_prev()? {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
+
+            if let Some(until_bound) = self.until
+                && created_at > until_bound
+            {
+                if !self.move_prev()? {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            if let Some(since_bound) = self.since
+                && created_at < since_bound
+            {
+                self.finished = true;
+                return Ok(None);
+            }
+
+            return Ok(Some(PostingEntry {
+                created_at,
+                seq: seq_bytes,
+            }));
+        }
+    }
+
+    fn move_prev(&mut self) -> Result<bool, SearchnosDBError> {
+        match self.cursor.get(None, None, MDB_PREV) {
+            Ok(_) => Ok(true),
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err.into()),
         }
     }
 }
 
-pub struct NgramCandidates {
-    postings: Vec<PostingCursor>,
+pub struct NgramCandidates<'txn> {
+    postings: Vec<PostingCursor<'txn>>,
 }
 
-impl NgramCandidates {
+impl<'txn> NgramCandidates<'txn> {
     fn empty() -> Self {
         Self {
             postings: Vec::new(),
         }
     }
 
-    fn new(postings: Vec<PostingCursor>) -> Self {
+    fn new(postings: Vec<PostingCursor<'txn>>) -> Self {
         Self { postings }
     }
 }
 
-impl Iterator for NgramCandidates {
+impl Iterator for NgramCandidates<'_> {
     type Item = Result<[u8; SEQ_BYTES], SearchnosDBError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -85,14 +180,18 @@ impl Iterator for NgramCandidates {
 
             if all_match {
                 for posting in &mut self.postings {
-                    posting.advance();
+                    if let Err(err) = posting.advance() {
+                        return Some(Err(err));
+                    }
                 }
                 return Some(Ok(target.seq));
             }
 
             for posting in &mut self.postings {
-                if posting.current() == Some(target) {
-                    posting.advance();
+                if posting.current() == Some(target)
+                    && let Err(err) = posting.advance()
+                {
+                    return Some(Err(err));
                 }
             }
         }
@@ -168,13 +267,13 @@ impl NgramIndex {
     }
 
     /// Iterate over all seq_bytes that match ALL search terms (AND logic)
-    pub fn iter_candidates(
+    pub fn iter_candidates<'env>(
         &self,
-        txn: &RoTransaction<'_>,
+        txn: &'env RoTransaction<'env>,
         terms: &[String],
         since: Option<u64>,
         until: Option<u64>,
-    ) -> Result<NgramCandidates, SearchnosDBError> {
+    ) -> Result<NgramCandidates<'env>, SearchnosDBError> {
         if terms.is_empty() {
             return Ok(NgramCandidates::empty());
         }
@@ -182,14 +281,17 @@ impl NgramIndex {
         let mut gram_set = BTreeSet::new();
 
         for term in terms {
-            let min_gram = preferred_min_query_ngram_size(term);
-            let grams = char_ngrams(term, min_gram, MAX_NGRAM_SIZE);
+            let grams = if USE_REPRESENTATIVE_QUERY_GRAMS {
+                representative_query_grams(term)
+            } else {
+                full_query_grams(term)
+            };
             if grams.is_empty() {
                 return Ok(NgramCandidates::empty());
             }
 
             for gram in grams {
-                gram_set.insert(gram.into_bytes());
+                gram_set.insert(gram);
             }
         }
 
@@ -199,11 +301,11 @@ impl NgramIndex {
 
         let mut postings = Vec::with_capacity(gram_set.len());
         for gram in gram_set {
-            let entries = self.collect_entries_for_gram(txn, &gram, since, until)?;
-            if entries.is_empty() {
+            let posting = PostingCursor::open(txn, self.db, gram, since, until)?;
+            if posting.current().is_none() {
                 return Ok(NgramCandidates::empty());
             }
-            postings.push(PostingCursor::new(entries));
+            postings.push(posting);
         }
 
         if postings.is_empty() {
@@ -211,83 +313,6 @@ impl NgramIndex {
         }
 
         Ok(NgramCandidates::new(postings))
-    }
-
-    fn collect_entries_for_gram(
-        &self,
-        txn: &RoTransaction<'_>,
-        gram: &[u8],
-        since: Option<u64>,
-        until: Option<u64>,
-    ) -> Result<Vec<PostingEntry>, SearchnosDBError> {
-        let mut cursor = txn.open_ro_cursor(self.db)?;
-        if !position_cursor_at_prefix_end(&mut cursor, gram)? {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-
-        loop {
-            let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
-                Ok((Some(key), value)) => (key, value),
-                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
-                Err(err) => return Err(err.into()),
-            };
-
-            if !key_bytes.starts_with(gram) {
-                break;
-            }
-
-            if key_bytes.len() != gram.len() + TS_SEQ_BYTES {
-                match cursor.get(None, None, MDB_PREV) {
-                    Ok(_) => continue,
-                    Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            }
-
-            if !key_bytes.starts_with(gram) {
-                break;
-            }
-
-            let (created_at, seq_bytes) = split_ts_seq_from_key(key_bytes)?;
-
-            if let Some(until_bound) = until
-                && created_at > until_bound
-            {
-                match cursor.get(None, None, MDB_PREV) {
-                    Ok(_) => continue,
-                    Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            }
-
-            if let Some(since_bound) = since
-                && created_at < since_bound
-            {
-                break;
-            }
-
-            entries.push(PostingEntry {
-                created_at,
-                seq: seq_bytes,
-            });
-
-            match cursor.get(None, None, MDB_PREV) {
-                Ok(_) => continue,
-                Err(lmdb::Error::NotFound) => break,
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        if entries.len() > 1 {
-            entries.sort_unstable_by(|a, b| match b.created_at.cmp(&a.created_at) {
-                std::cmp::Ordering::Equal => b.seq.cmp(&a.seq),
-                other => other,
-            });
-        }
-
-        Ok(entries)
     }
 
     fn key_with_suffix<G>(gram: &G, created_at: u64, seq: u64) -> Vec<u8>
@@ -299,5 +324,57 @@ impl NgramIndex {
         key.extend_from_slice(gram_bytes);
         append_ts_seq(&mut key, created_at, seq);
         key
+    }
+}
+
+fn representative_query_grams(term: &str) -> Vec<Vec<u8>> {
+    let grams = full_query_grams(term);
+    match grams.as_slice() {
+        [] => Vec::new(),
+        [one] => vec![one.clone()],
+        [first, second] => vec![first.clone(), second.clone()],
+        _ => {
+            let first = grams.first().expect("non-empty").clone();
+            let last = grams.last().expect("non-empty").clone();
+            if first == last {
+                vec![first]
+            } else {
+                vec![first, last]
+            }
+        }
+    }
+}
+
+fn full_query_grams(term: &str) -> Vec<Vec<u8>> {
+    let min_gram = preferred_min_query_ngram_size(term);
+    char_ngrams(term, min_gram, MAX_NGRAM_SIZE)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{full_query_grams, representative_query_grams};
+
+    #[test]
+    fn representative_query_grams_keeps_short_terms() {
+        let term = "go";
+        let all = full_query_grams(term);
+        assert_eq!(representative_query_grams(term), all);
+    }
+
+    #[test]
+    fn representative_query_grams_picks_subset_for_long_terms() {
+        let term = "rustacean";
+        let all = full_query_grams(term).into_iter().collect::<BTreeSet<_>>();
+        let selected = representative_query_grams(term);
+        assert!(!selected.is_empty());
+        assert!(selected.len() <= 2);
+        for gram in selected {
+            assert!(all.contains(&gram));
+        }
     }
 }

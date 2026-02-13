@@ -47,10 +47,11 @@ fn report_stats(result: &searchnos_db::QueryResult) {
 
     for (idx, filter_stats) in stats.filters.iter().enumerate() {
         eprintln!(
-            "  filter #{idx}: {:?} (index: {:.3} ms, post: {:.3} ms, matches: {})",
+            "  filter #{idx}: {:?} (index: {:.3} ms, post: {:.3} ms, candidates: {}, matches: {})",
             filter_stats.plan.source,
             duration_ms(filter_stats.index_scan_duration),
             duration_ms(filter_stats.post_processing_duration),
+            filter_stats.candidate_count,
             filter_stats.matched_event_count,
         );
     }
