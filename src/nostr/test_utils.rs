@@ -1,4 +1,4 @@
-use secp256k1::{Keypair, Secp256k1};
+use secp256k1::{Keypair, Secp256k1, rand};
 use serde_json::{Map, Value};
 
 use super::{
