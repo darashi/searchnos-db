@@ -407,8 +407,8 @@ impl SearchnosDB {
                 let created_at = split_created_at_from_key(key_bytes)?;
                 if created_at <= cutoff {
                     return match cursor.get(None, None, MDB_LAST_DUP) {
-                        Ok((Some(last_key), _)) => Ok(last_key.starts_with(prefix)),
-                        Ok((None, _)) | Err(lmdb::Error::NotFound) => Ok(false),
+                        Ok(_) => Ok(true),
+                        Err(lmdb::Error::NotFound) => Ok(false),
                         Err(err) => Err(err.into()),
                     };
                 }

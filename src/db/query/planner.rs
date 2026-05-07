@@ -1,5 +1,4 @@
-use ndb::MatchEventOptions;
-
+use crate::ndb_ext::MatchEventOptions;
 use crate::nostr::{EventId, Filter, Kind, PublicKey};
 
 use crate::text::normalize_query_terms;

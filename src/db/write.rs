@@ -7,12 +7,13 @@ use std::{
 
 use lmdb::{Cursor, RwTransaction, Transaction, WriteFlags};
 use lmdb_sys::{MDB_GET_BOTH, MDB_LAST};
-use ndb::{NdbNote, from_ndb_note, to_ndb_note};
+use ndb::NdbNote;
 
 use crate::nostr::{
     Event, EventId, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp, extract_event_expiration,
 };
 
+use crate::ndb_ext::{from_ndb_note, to_ndb_note};
 use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams};
 
 use super::{
@@ -226,7 +227,7 @@ impl SearchnosDB {
         };
 
         let existing_note =
-            ndb::NdbNote::from_bytes(existing_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+            NdbNote::from_bytes(existing_bytes).map_err(SearchnosDBError::DecodeEvent)?;
         let existing_created = existing_note.created_at();
         let this_created = event.created_at.as_u64();
 

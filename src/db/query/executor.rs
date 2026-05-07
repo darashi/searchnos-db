@@ -6,13 +6,14 @@ use std::{
 };
 
 use lmdb::{RoTransaction, Transaction};
-use ndb::{Filter as NdbFilter, NdbNote, from_ndb_note};
+use ndb::NdbNote;
 
 use crate::nostr::{Filter, Kind, extract_note_expiration};
 
 use crate::db::{
     FilterPlanStats, QueryResult, QueryStats, SEQ_BYTES, SearchnosDB, SearchnosDBError,
 };
+use crate::ndb_ext::{NdbFilter, from_ndb_note, note_matches_filter};
 use crate::text::{normalize_query_terms, normalize_text};
 
 struct PlanCollectionResult {
@@ -238,7 +239,7 @@ impl SearchnosDB {
             let (note, content_bytes) = self.load_note_and_content(txn, &seq_bytes)?;
 
             // Check all filter conditions
-            if !note.matches_filter(&ndb_filter, plan.match_opts, content_bytes.as_ref()) {
+            if !note_matches_filter(&note, &ndb_filter, plan.match_opts, content_bytes.as_ref()) {
                 continue;
             }
 
@@ -284,9 +285,9 @@ impl SearchnosDB {
         let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
         let content_bytes = match txn.get(self.contents.database(), seq_bytes) {
             Ok(bytes) => Cow::Borrowed(bytes),
-            Err(lmdb::Error::NotFound) => match note.content_str() {
+            Err(lmdb::Error::NotFound) => match note.content() {
                 Ok(text) => Cow::Owned(normalize_text(text).into_bytes()),
-                Err(_) => Cow::Owned(note.content().to_vec()),
+                Err(_) => Cow::Owned(Vec::new()),
             },
             Err(err) => return Err(err.into()),
         };

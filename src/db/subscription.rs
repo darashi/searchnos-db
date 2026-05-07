@@ -6,11 +6,12 @@ use std::task::{Context, Poll};
 
 use crate::nostr::{Filter, extract_note_expiration};
 use futures_core::Stream;
-use ndb::{MatchEventOptions, NdbNote};
+use ndb::NdbNote;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::db::SearchnosDB;
+use crate::ndb_ext::{MatchEventOptions, note_matches_filter};
 use crate::text::normalize_query_terms;
 
 pub(crate) const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 32_768;
@@ -166,7 +167,7 @@ impl SearchnosDB {
 
         let ndb_filter = Self::to_ndb_filter(filter, true);
         let options = MatchEventOptions::new();
-        if !note.matches_filter(&ndb_filter, options, normalized_content) {
+        if !note_matches_filter(note, &ndb_filter, options, normalized_content) {
             return false;
         }
 

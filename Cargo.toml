@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 lmdb = "0.8.0"
 thiserror = "2.0.16"
-ndb = { path = "ndb" }
+ndb = { package = "ndb-note-rs", git = "https://github.com/darashi/ndb-note-rs" }
 indicatif = "0.18.0"
 lmdb-sys = "0.8.0"
 clap = { version = "4.5.4", features = ["derive"] }

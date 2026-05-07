@@ -6,12 +6,12 @@ use super::{
     QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription, write::InsertResult,
 };
 
+use crate::ndb_ext::from_ndb_note;
 use crate::nostr::{
     Event, EventId, Filter, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp,
     test_utils::{EventBuilder, Keys},
 };
 use lmdb::{Cursor, RoTransaction, Transaction};
-use ndb::from_ndb_note;
 use serde_json::to_string as to_json_string;
 
 pub(crate) struct TestDatabase {
