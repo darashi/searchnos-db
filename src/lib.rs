@@ -5,8 +5,8 @@ mod text;
 
 pub use db::query::{PlanSource, QueryPlan};
 pub use db::{
-    DatabaseStats, DumpProgress, FilterPlanStats, PurgePolicy, PurgeSpecError, QueryResult,
-    QueryStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem, Subscription,
-    SubscriptionWithStats,
+    DatabaseStats, DumpProgress, FilterPlanStats, LoadProgress, PurgePolicy, PurgeSpecError,
+    QueryResult, QueryStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem,
+    Subscription, SubscriptionWithStats,
 };
 pub use ndb_ext::MatchEventOptions;

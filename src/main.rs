@@ -25,6 +25,12 @@ enum Command {
         #[arg(value_name = "FILE", value_hint = ValueHint::FilePath)]
         output_path: PathBuf,
     },
+    /// Load ndb notes from a length-prefixed binary dump
+    Load {
+        /// Path to the input dump file
+        #[arg(value_name = "FILE", value_hint = ValueHint::FilePath)]
+        input_path: PathBuf,
+    },
     /// Print events as JSON
     Query {
         /// Filter(s) as JSON: accepts an object for a single filter or an array for multiple
@@ -61,6 +67,7 @@ fn run() -> Result<(), CliError> {
     match command {
         Command::Stat => cmd::stat::run(&db_path),
         Command::Dump { output_path } => cmd::dump::run(&db_path, &output_path),
+        Command::Load { input_path } => cmd::load::run(&db_path, &input_path),
         Command::Query { filters } => cmd::query::run(&db_path, filters),
         Command::Import {
             import_paths,

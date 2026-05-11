@@ -2,9 +2,10 @@ use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
 
+use crate::ndb_ext::from_ndb_note;
 use crate::nostr::{EventError, Filter};
 use serde_json::{Map, Value};
-use std::io::Write;
+use std::io::{ErrorKind, Read, Write};
 use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
 use std::{mem, sync::Arc};
 
@@ -146,6 +147,12 @@ pub struct DumpProgress {
     pub events_written: u64,
     pub total_events: u64,
     pub bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadProgress {
+    pub events_loaded: u64,
+    pub bytes_read: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -460,6 +467,71 @@ impl SearchnosDB {
         Ok(count)
     }
 
+    /// Load ndb notes from repeated `(u32 length, payload)` records.
+    ///
+    /// The length prefix must be encoded as big-endian bytes. Payload bytes are
+    /// decoded as `ndb_note` records and inserted through the normal event
+    /// insertion path.
+    pub fn load_events<R: Read>(&self, reader: R) -> Result<u64, SearchnosDBError> {
+        self.load_events_with_progress(reader, |_| {})
+    }
+
+    /// Load ndb notes and report progress after each record is read.
+    pub fn load_events_with_progress<R, F>(
+        &self,
+        mut reader: R,
+        mut on_progress: F,
+    ) -> Result<u64, SearchnosDBError>
+    where
+        R: Read,
+        F: FnMut(LoadProgress),
+    {
+        let mut count = 0u64;
+        let mut bytes_read = 0u64;
+
+        loop {
+            let Some(len) = Self::read_dump_record_length(&mut reader)? else {
+                break;
+            };
+            bytes_read += DUMP_LENGTH_PREFIX_BYTES;
+
+            let mut payload = vec![0u8; len as usize];
+            reader.read_exact(&mut payload)?;
+            bytes_read += u64::from(len);
+
+            let event_json = from_ndb_note(&payload).map_err(SearchnosDBError::DecodeEvent)?;
+            self.insert_event_json_owned(event_json)?;
+            count += 1;
+            on_progress(LoadProgress {
+                events_loaded: count,
+                bytes_read,
+            });
+        }
+
+        self.flush()?;
+        Ok(count)
+    }
+
+    fn read_dump_record_length<R: Read>(reader: &mut R) -> Result<Option<u32>, SearchnosDBError> {
+        let mut prefix = [0u8; std::mem::size_of::<u32>()];
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => {}
+            Ok(_) => unreachable!("single-byte buffer cannot read more than one byte"),
+            Err(err) => return Err(err.into()),
+        }
+
+        match reader.read_exact(&mut prefix[1..]) {
+            Ok(()) => Ok(Some(u32::from_be_bytes(prefix))),
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "dump record length prefix is truncated",
+            )
+            .into()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn database_entry_count<T>(txn: &T, database: Database) -> Result<u64, SearchnosDBError>
     where
         T: Transaction,
@@ -645,6 +717,32 @@ mod tests {
         assert_eq!(progress[1].events_written, 2);
         assert_eq!(progress[1].total_events, 2);
         assert_eq!(progress[1].bytes_written as usize, dumped.len());
+    }
+
+    #[test]
+    fn load_events_reads_length_prefixed_ndb_notes() {
+        let source = TestDatabase::new();
+        let keys = Keys::generate();
+        let first = EventBuilder::text_note("first loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build first event");
+        let second = EventBuilder::text_note("second loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build second event");
+
+        source.insert(&first);
+        source.insert(&second);
+        let dumped = source.dump_events();
+
+        let destination = TestDatabase::new();
+        let progress = destination.load_events_with_progress(&dumped);
+
+        let loaded_events = destination.query(&[Filter::new().search("loaded")]);
+        assert_eq!(loaded_events.len(), 2);
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].events_loaded, 1);
+        assert_eq!(progress[1].events_loaded, 2);
+        assert_eq!(progress[1].bytes_read as usize, dumped.len());
     }
 
     #[test]

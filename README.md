@@ -55,6 +55,12 @@ Writes all stored `ndb_note` payloads to a binary dump file with a progress bar.
 1. 4-byte unsigned payload length encoded as big-endian `u32`
 2. Raw `ndb_note` payload bytes of that length
 
+### Load events
+```bash
+cargo run -- load ./events.dump --db-path ./data
+```
+Reads the binary dump format produced by `dump` and inserts each event through the normal write path. Existing duplicate, deletion, expiration, and replaceable-event rules still apply.
+
 ### Query events
 ```bash
 cargo run -- query '{"authors": ["<hex pubkey>"], "kinds": [1]}'
@@ -76,13 +82,13 @@ db.insert_event_json(raw_event)?;
 db.flush()?; // ensure pending batches are written
 ```
 
-### Dump from Rust
-Use `dump_events` when the caller only needs the serialized stream, or `dump_events_with_progress` when the caller wants to report progress. The crate writes to any `std::io::Write`, so file creation, compression, or network transport can remain the caller's responsibility.
+### Dump and load from Rust
+Use `dump_events` or `load_events` when the caller only needs the serialized stream, and the `_with_progress` variants when the caller wants to report progress. The crate reads from any `std::io::Read` and writes to any `std::io::Write`, so file creation, compression, or network transport can remain the caller's responsibility.
 
 ```rust
-use searchnos_db::{DumpProgress, SearchnosDB};
+use searchnos_db::{DumpProgress, LoadProgress, SearchnosDB};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 
 let db = SearchnosDB::open("./data")?;
 let file = File::create("./events.dump")?;
@@ -94,6 +100,17 @@ db.dump_events_with_progress(writer, |progress: DumpProgress| {
         progress.events_written,
         progress.total_events,
         progress.bytes_written,
+    );
+})?;
+
+let file = File::open("./events.dump")?;
+let reader = BufReader::new(file);
+
+db.load_events_with_progress(reader, |progress: LoadProgress| {
+    eprintln!(
+        "loaded {} events ({} bytes read)",
+        progress.events_loaded,
+        progress.bytes_read,
     );
 })?;
 ```

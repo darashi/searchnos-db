@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 pub mod dump;
 pub mod import;
+pub mod load;
 pub mod query;
 pub mod stat;
 
@@ -42,4 +43,11 @@ pub(crate) fn default_progress_style() -> ProgressStyle {
     .with_key("per_sec_ev", |state: &ProgressState, w: &mut dyn Write| {
         let _ = write!(w, "{:.2} ev/s", state.per_sec());
     })
+}
+
+pub(crate) fn byte_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{percent:>3}%|{bar:40}| {bytes}/{total_bytes} [{elapsed_precise}<{eta_precise}, {bytes_per_sec}]",
+    )
+    .expect("progress style")
 }
