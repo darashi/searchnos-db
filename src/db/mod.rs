@@ -61,8 +61,7 @@ const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
 const DUMP_LENGTH_PREFIX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
 use index::{
-    ContentsStore, CreatedAtIndex, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex,
-    NgramIndex, PubkeyIndex, PubkeyKindIndex, ReplacableIndex, TagIndex,
+    ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex, ReplacableIndex,
 };
 
 #[derive(Debug)]
@@ -70,15 +69,10 @@ pub struct SearchnosDB {
     env: Environment,
     events: Database,
     event_id_index: EventIdIndex,
-    created_at_index: CreatedAtIndex,
-    pubkey_index: PubkeyIndex,
     kind_index: KindsIndex,
-    pubkey_kind_index: PubkeyKindIndex,
     deletions: DeletionIndex,
     replacables: ReplacableIndex,
     contents: ContentsStore,
-    ngram_index: NgramIndex,
-    tag_index: TagIndex,
     expiration_index: ExpirationIndex,
     batch: Mutex<BatchState>,
     purge_policy: Option<PurgePolicy>,
@@ -204,15 +198,10 @@ impl SearchnosDB {
 
         let events = env.create_db(Some(EVENTS_DB_NAME), DatabaseFlags::INTEGER_KEY)?;
         let event_id_index = EventIdIndex::open(&env)?;
-        let created_at_index = CreatedAtIndex::open(&env)?;
-        let pubkey_index = PubkeyIndex::open(&env)?;
         let kind_index = KindsIndex::open(&env)?;
-        let pubkey_kind_index = PubkeyKindIndex::open(&env)?;
         let deletions = DeletionIndex::open(&env)?;
         let replacables = ReplacableIndex::open(&env)?;
         let contents = ContentsStore::open(&env)?;
-        let ngram_index = NgramIndex::open(&env)?;
-        let tag_index = TagIndex::open(&env)?;
         let expiration_index = ExpirationIndex::open(&env)?;
         let batch = Mutex::new(BatchState::new(options.batch_size, options.flush_interval));
         let purge_policy = options.purge_policy.clone();
@@ -222,15 +211,10 @@ impl SearchnosDB {
             env,
             events,
             event_id_index,
-            created_at_index,
-            pubkey_index,
             kind_index,
-            pubkey_kind_index,
             deletions,
             replacables,
             contents,
-            ngram_index,
-            tag_index,
             expiration_index,
             batch,
             purge_policy,
@@ -656,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_event_persists_all_indexes() {
+    fn insert_event_persists_storage_and_required_indexes() {
         let db = TestDatabase::new();
         let keys = Keys::generate();
         let event = EventBuilder::text_note("hello searchnos")
@@ -840,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_event_removes_primary_and_secondary_indexes() {
+    fn delete_event_removes_storage_and_required_indexes() {
         let db = TestDatabase::new();
         let keys = Keys::generate();
 

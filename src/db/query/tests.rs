@@ -29,64 +29,66 @@ fn add_pubkey(filter: Filter, pubkey: PublicKey) -> Filter {
 }
 
 #[test]
-fn query_plan_uses_event_id_index_when_ids_specified() {
+fn query_plan_uses_contents_scan_when_ids_specified() {
     let filter = Filter::new().id(EventId::from([0u8; 32]));
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::EventIds { .. }));
-    assert!(!plan.match_opts.id);
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
+    assert!(plan.match_opts.id);
 }
 
 #[test]
-fn query_plan_defaults_to_created_at_scan_without_ids() {
+fn query_plan_defaults_to_contents_scan_without_ids() {
     let filter = Filter::new();
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::CreatedAt));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
     assert!(plan.match_opts.id);
+    assert!(!plan.match_opts.nip50);
 }
 
 #[test]
-fn query_plan_prefers_ngram_search_for_search_terms() {
+fn query_plan_checks_search_terms_during_contents_scan() {
     let filter = Filter::new().search("rustacean");
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::NgramSearch { .. }));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
     assert!(plan.match_opts.id);
+    assert!(plan.match_opts.nip50);
 }
 
 #[test]
-fn query_plan_uses_author_index_when_authors_specified() {
+fn query_plan_uses_contents_scan_when_authors_specified() {
     let keys = Keys::generate();
     let filter = Filter::new().author(keys.public_key());
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::Authors { .. }));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
 }
 
 #[test]
-fn query_plan_uses_kind_index_when_kinds_specified() {
+fn query_plan_uses_contents_scan_when_kinds_specified() {
     let filter = Filter::new().kind(Kind::LongFormTextNote);
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::Kinds { .. }));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
 }
 
 #[test]
-fn query_plan_uses_pubkey_kind_index_when_author_and_kind_filters_small() {
+fn query_plan_uses_contents_scan_when_author_and_kind_filters_specified() {
     let keys = Keys::generate();
     let filter = Filter::new().author(keys.public_key()).kind(Kind::TextNote);
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::PubkeyKinds { .. }));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
 }
 
 #[test]
-fn query_plan_uses_tag_index_when_tags_specified() {
+fn query_plan_uses_contents_scan_when_tags_specified() {
     let filter = filter_with_hashtag("nostr");
     let plan = super::QueryPlan::for_filter(&filter);
 
-    assert!(matches!(plan.source, super::PlanSource::Tags { .. }));
+    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
     assert!(!plan.match_opts.nip50);
 }
 
@@ -176,7 +178,7 @@ fn query_applies_search_terms_to_normalized_content() {
 }
 
 #[test]
-fn query_handles_short_search_terms_via_ngram_index() {
+fn query_handles_short_search_terms() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -199,7 +201,7 @@ fn query_handles_short_search_terms_via_ngram_index() {
 }
 
 #[test]
-fn query_handles_single_character_search_via_ngram_index() {
+fn query_handles_single_character_search() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -469,7 +471,7 @@ fn query_clamps_limit_to_max_limit() {
 }
 
 #[test]
-fn query_created_at_index_prefers_newest_with_limit() {
+fn query_contents_scan_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -497,7 +499,7 @@ fn query_created_at_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_author_index_prefers_newest_with_limit() {
+fn query_author_filter_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -525,7 +527,7 @@ fn query_author_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_kind_index_prefers_newest_with_limit() {
+fn query_kind_filter_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -553,7 +555,7 @@ fn query_kind_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_tag_index_prefers_newest_with_limit() {
+fn query_tag_filter_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -584,7 +586,7 @@ fn query_tag_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_pubkey_kind_index_prefers_newest_with_limit() {
+fn query_author_kind_filter_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -617,7 +619,7 @@ fn query_pubkey_kind_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_ngram_index_prefers_newest_with_limit() {
+fn query_search_filter_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -645,7 +647,7 @@ fn query_ngram_index_prefers_newest_with_limit() {
 }
 
 #[test]
-fn query_filters_by_author_using_author_index() {
+fn query_filters_by_author() {
     let db = TestDatabase::new();
     let primary_keys = Keys::generate();
     let other_keys = Keys::generate();
@@ -677,7 +679,7 @@ fn query_filters_by_author_using_author_index() {
 }
 
 #[test]
-fn query_filters_by_kind_using_kind_index() {
+fn query_filters_by_kind() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -700,7 +702,7 @@ fn query_filters_by_kind_using_kind_index() {
 }
 
 #[test]
-fn query_filters_by_author_and_kind_using_pubkey_kind_index() {
+fn query_filters_by_author_and_kind() {
     let db = TestDatabase::new();
     let primary_keys = Keys::generate();
     let other_keys = Keys::generate();
@@ -816,7 +818,7 @@ fn query_matches_events_by_event_tag() {
 }
 
 #[test]
-fn query_filters_by_hashtag_using_tag_index() {
+fn query_filters_by_hashtag() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -1003,16 +1005,14 @@ fn query_with_stats_reports_plan_details() {
     assert!(result.stats.total_elapsed >= result.stats.index_scan_duration);
     assert!(result.stats.total_elapsed >= result.stats.post_processing_duration);
     assert!(result.stats.filters[0].candidate_count >= result.stats.filters[0].matched_event_count);
-    match &result.stats.filters[0].plan.source {
-        super::PlanSource::Authors { pubkeys } => {
-            assert_eq!(pubkeys, &vec![keys.public_key()]);
-        }
-        other => panic!("expected Authors plan, got {other:?}"),
-    }
+    assert!(matches!(
+        result.stats.filters[0].plan.source,
+        super::PlanSource::ContentsScan
+    ));
 }
 
 #[test]
-fn query_kind_index_respects_since_bound_for_candidate_counts() {
+fn query_contents_scan_stops_at_since_bound() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -1041,7 +1041,7 @@ fn query_kind_index_respects_since_bound_for_candidate_counts() {
 }
 
 #[test]
-fn query_tag_index_respects_until_bound_for_candidate_counts() {
+fn query_contents_scan_starts_at_until_bound() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -1072,7 +1072,7 @@ fn query_tag_index_respects_until_bound_for_candidate_counts() {
 }
 
 #[test]
-fn query_with_stats_limits_candidate_counts_when_limit_met() {
+fn query_with_stats_stops_when_limit_is_met() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 

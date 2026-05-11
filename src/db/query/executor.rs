@@ -1,20 +1,21 @@
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     collections::HashSet,
     time::{Duration, Instant},
 };
 
-use lmdb::{RoTransaction, Transaction};
+use lmdb::{Cursor, RoCursor, RoTransaction, Transaction};
+use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 use ndb::NdbNote;
 
 use crate::nostr::{Filter, Kind, extract_note_expiration};
 
 use crate::db::{
     FilterPlanStats, QueryResult, QueryStats, SEQ_BYTES, SearchnosDB, SearchnosDBError,
+    index::ContentsStore,
 };
 use crate::ndb_ext::{NdbFilter, from_ndb_note, note_matches_filter};
-use crate::text::{normalize_query_terms, normalize_text};
+use crate::text::normalize_query_terms;
 
 struct PlanCollectionResult {
     keys: Vec<(u64, [u8; SEQ_BYTES])>,
@@ -172,6 +173,9 @@ impl SearchnosDB {
 
         // Only include search in ndb_filter if it will be checked (nip50 == true)
         let ndb_filter = Self::to_ndb_filter(filter, plan.match_opts.nip50);
+        // Apply unified filtering logic over normalized content rows.
+        let mut keys = Vec::new();
+        let mut candidate_count = 0usize;
         let since = filter.since.map(|ts| ts.as_u64());
         let until = filter.until.map(|ts| ts.as_u64());
         let early_exit_limit = if plan.source.produces_descending_created_at() {
@@ -179,67 +183,38 @@ impl SearchnosDB {
         } else {
             None
         };
+        let mut cursor = txn.open_ro_cursor(self.contents.database())?;
+        let mut positioned = ContentsStore::position_cursor(&mut cursor, until)?;
 
-        // Get iterator of candidates from the chosen index
-        let candidates: Box<dyn Iterator<Item = Result<[u8; SEQ_BYTES], SearchnosDBError>> + 'env> =
-            match &plan.source {
-                super::PlanSource::EventIds { ids } => {
-                    let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes() as &[u8]).collect();
-                    Box::new(self.event_id_index.iter_candidates(txn, &id_refs)?.map(Ok))
-                }
-                super::PlanSource::NgramSearch { .. } => {
-                    let terms = search_terms
-                        .as_ref()
-                        .expect("filters with search queries must provide normalized terms");
-                    Box::new(self.ngram_index.iter_candidates(txn, terms, since, until)?)
-                }
-                super::PlanSource::PubkeyKinds { pubkeys, kinds } => {
-                    let pubkey_refs: Vec<&[u8]> =
-                        pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
-                    let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
-                    Box::new(
-                        self.pubkey_kind_index
-                            .iter_candidates(txn, &pubkey_refs, &kind_u16s, since, until)?
-                            .map(Ok),
-                    )
-                }
-                super::PlanSource::Tags { entries } => Box::new(
-                    self.tag_index
-                        .iter_candidates(txn, entries, since, until)?
-                        .map(Ok),
-                ),
-                super::PlanSource::Authors { pubkeys } => {
-                    let pubkey_refs: Vec<&[u8]> =
-                        pubkeys.iter().map(|pk| pk.as_bytes() as &[u8]).collect();
-                    Box::new(
-                        self.pubkey_index
-                            .iter_candidates(txn, &pubkey_refs, since, until)?
-                            .map(Ok),
-                    )
-                }
-                super::PlanSource::Kinds { kinds } => {
-                    let kind_u16s: Vec<u16> = kinds.iter().map(|k| k.as_u16()).collect();
-                    Box::new(
-                        self.kind_index
-                            .iter_candidates(txn, &kind_u16s, since, until)?
-                            .map(Ok),
-                    )
-                }
-                super::PlanSource::CreatedAt => {
-                    Box::new(self.created_at_index.iter_candidates(txn, since, until)?)
-                }
+        while positioned {
+            let (contents_key, content_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(key), value)) => (key, value),
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
             };
 
-        // Apply unified filtering logic
-        let mut keys = Vec::new();
-        let mut candidate_count = 0usize;
-        for candidate in candidates {
-            let seq_bytes = candidate?;
+            let (created_at, seq_bytes) = ContentsStore::split_key(contents_key)?;
+
+            if let Some(since) = since
+                && created_at < since
+            {
+                break;
+            }
+
+            if let Some(until) = until
+                && created_at > until
+            {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+                continue;
+            }
+
             candidate_count = candidate_count.saturating_add(1);
-            let (note, content_bytes) = self.load_note_and_content(txn, &seq_bytes)?;
+            let event_bytes = txn.get(self.events, &seq_bytes)?;
+            let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
 
             // Check all filter conditions
-            if !note_matches_filter(&note, &ndb_filter, plan.match_opts, content_bytes.as_ref()) {
+            if !note_matches_filter(&note, &ndb_filter, plan.match_opts, content_bytes) {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
                 continue;
             }
 
@@ -247,10 +222,10 @@ impl SearchnosDB {
                 && !Self::note_is_ephemeral(&note)
                 && Self::is_expired(expiration)
             {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
                 continue;
             }
 
-            let created_at = note.created_at();
             keys.push((created_at, seq_bytes));
 
             if let Some(limit) = early_exit_limit
@@ -258,6 +233,8 @@ impl SearchnosDB {
             {
                 break;
             }
+
+            positioned = Self::move_contents_cursor_prev(&mut cursor)?;
         }
 
         if let Some(limit) = filter.limit
@@ -276,22 +253,12 @@ impl SearchnosDB {
         })
     }
 
-    fn load_note_and_content<'env>(
-        &self,
-        txn: &'env RoTransaction<'env>,
-        seq_bytes: &[u8; SEQ_BYTES],
-    ) -> Result<(NdbNote<'env>, Cow<'env, [u8]>), SearchnosDBError> {
-        let event_bytes = txn.get(self.events, seq_bytes)?;
-        let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-        let content_bytes = match txn.get(self.contents.database(), seq_bytes) {
-            Ok(bytes) => Cow::Borrowed(bytes),
-            Err(lmdb::Error::NotFound) => match note.content() {
-                Ok(text) => Cow::Owned(normalize_text(text).into_bytes()),
-                Err(_) => Cow::Owned(Vec::new()),
-            },
-            Err(err) => return Err(err.into()),
-        };
-        Ok((note, content_bytes))
+    fn move_contents_cursor_prev(cursor: &mut RoCursor<'_>) -> Result<bool, SearchnosDBError> {
+        match cursor.get(None, None, MDB_PREV) {
+            Ok(_) => Ok(true),
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub(crate) fn note_is_ephemeral(note: &NdbNote<'_>) -> bool {

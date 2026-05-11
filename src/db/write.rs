@@ -6,7 +6,7 @@ use std::{
 };
 
 use lmdb::{Cursor, RwTransaction, Transaction, WriteFlags};
-use lmdb_sys::{MDB_GET_BOTH, MDB_LAST};
+use lmdb_sys::MDB_LAST;
 use ndb::NdbNote;
 
 use crate::nostr::{
@@ -14,11 +14,10 @@ use crate::nostr::{
 };
 
 use crate::ndb_ext::{from_ndb_note, to_ndb_note};
-use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams};
 
 use super::{
     KEY_BYTES, SEQ_BYTES, SearchnosDB, SearchnosDBError,
-    normalize::{EventIndexData, build_event_index_key, collect_tag_keys},
+    normalize::{EventIndexData, build_event_index_key},
 };
 
 #[derive(Debug)]
@@ -269,18 +268,17 @@ impl SearchnosDB {
     ) -> Result<(), SearchnosDBError> {
         let key_bytes = seq.to_ne_bytes();
         txn.put(self.events, &key_bytes, &note_bytes, WriteFlags::empty())?;
-        self.contents
-            .put(txn, &key_bytes, &index_data.normalized_content)?;
-
-        let created_at = index_data.created_at;
-        for gram in &index_data.ngrams {
-            self.ngram_index.put(txn, gram, created_at, seq)?;
-        }
+        self.contents.put(
+            txn,
+            index_data.created_at,
+            seq,
+            &index_data.normalized_content,
+        )?;
 
         Ok(())
     }
 
-    /// Update all indexes for the inserted event
+    /// Update required indexes for the inserted event.
     fn update_indexes<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
@@ -291,24 +289,10 @@ impl SearchnosDB {
     ) -> Result<(), SearchnosDBError> {
         let created_at = index_data.created_at;
 
-        self.pubkey_index
-            .put(txn, event.pubkey.as_bytes(), created_at, seq)?;
         self.kind_index
             .put(txn, event.kind.as_u16(), created_at, seq)?;
-        self.pubkey_kind_index.put(
-            txn,
-            event.pubkey.as_bytes(),
-            event.kind.as_u16(),
-            created_at,
-            seq,
-        )?;
         self.event_id_index
             .put(txn, &index_data.event_index_key, seq)?;
-        self.created_at_index.put(txn, created_at, seq)?;
-
-        for tag_key in &index_data.tag_keys {
-            self.tag_index.put(txn, tag_key, created_at, seq)?;
-        }
 
         if let Some(expiration_ts) = expiration {
             self.expiration_index.put(txn, expiration_ts, seq)?;
@@ -476,11 +460,6 @@ impl SearchnosDB {
 
         let event_json = from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
         let event = Event::from_json(&event_json)?;
-        let normalized_content = match txn.get(self.contents.database(), &event_key) {
-            Ok(bytes) => Some(std::str::from_utf8(bytes)?.to_string()),
-            Err(lmdb::Error::NotFound) => None,
-            Err(err) => return Err(err.into()),
-        };
 
         let event_index_key = build_event_index_key(&event);
 
@@ -502,36 +481,9 @@ impl SearchnosDB {
 
         self.event_id_index.delete(txn, &event_index_key)?;
 
-        let created_at_key = event.created_at.as_u64().to_ne_bytes();
-        {
-            let mut cursor = txn.open_rw_cursor(self.created_at_index.database())?;
-            match cursor.get(Some(&created_at_key), Some(&event_key), MDB_GET_BOTH) {
-                Ok(_) => match cursor.del(WriteFlags::CURRENT) {
-                    Ok(()) => {}
-                    Err(lmdb::Error::NotFound) => {}
-                    Err(err) => return Err(err.into()),
-                },
-                Err(lmdb::Error::NotFound) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-
         let created_at = event.created_at.as_u64();
-        self.pubkey_index
-            .delete_value(txn, event.pubkey.as_bytes(), created_at, seq)?;
         self.kind_index
             .delete_value(txn, event.kind.as_u16(), created_at, seq)?;
-        self.pubkey_kind_index.delete_value(
-            txn,
-            event.pubkey.as_bytes(),
-            event.kind.as_u16(),
-            created_at,
-            seq,
-        )?;
-        for tag_key in collect_tag_keys(&event) {
-            self.tag_index
-                .delete_value(txn, &tag_key, created_at, seq)?;
-        }
 
         if let Some(replacable_key) = Self::replacable_key(&event) {
             self.replacables.delete_entry(txn, &replacable_key, seq)?;
@@ -542,15 +494,7 @@ impl SearchnosDB {
             Err(err) => return Err(err.into()),
         }
 
-        self.contents.delete(txn, &event_key)?;
-
-        if let Some(content) = normalized_content {
-            for gram in char_ngrams(&content, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
-                let gram_bytes = gram.into_bytes();
-                self.ngram_index
-                    .delete_entry(txn, &gram_bytes, event.created_at.as_u64(), seq)?;
-            }
-        }
+        self.contents.delete(txn, created_at, seq)?;
 
         Ok(true)
     }

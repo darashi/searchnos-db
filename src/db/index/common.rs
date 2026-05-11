@@ -3,17 +3,9 @@ use lmdb_sys::{MDB_LAST, MDB_PREV, MDB_SET_RANGE};
 
 use crate::db::{CREATED_AT_BYTES, SEQ_BYTES, SearchnosDBError};
 
-pub const TS_SEQ_BYTES: usize = CREATED_AT_BYTES + SEQ_BYTES;
-
 /// Append created_at (big-endian) to the provided key buffer.
 pub fn append_created_at(key: &mut Vec<u8>, created_at: u64) {
     key.extend_from_slice(&created_at.to_be_bytes());
-}
-
-/// Append created_at/seq suffix (big-endian) to the provided key buffer.
-pub fn append_ts_seq(key: &mut Vec<u8>, created_at: u64, seq: u64) {
-    key.extend_from_slice(&created_at.to_be_bytes());
-    key.extend_from_slice(&seq.to_be_bytes());
 }
 
 /// Extract created_at suffix from a key.
@@ -24,20 +16,6 @@ pub fn split_created_at_from_key(key: &[u8]) -> Result<u64, SearchnosDBError> {
     let mut created_at_bytes = [0u8; CREATED_AT_BYTES];
     created_at_bytes.copy_from_slice(&key[key.len() - CREATED_AT_BYTES..]);
     Ok(u64::from_be_bytes(created_at_bytes))
-}
-
-/// Extract created_at and seq suffix from a key.
-pub fn split_ts_seq_from_key(key: &[u8]) -> Result<(u64, [u8; SEQ_BYTES]), SearchnosDBError> {
-    if key.len() < TS_SEQ_BYTES {
-        return Err(SearchnosDBError::InvalidKeyLength(key.len()));
-    }
-    let suffix = &key[key.len() - TS_SEQ_BYTES..];
-    let mut created_at_bytes = [0u8; CREATED_AT_BYTES];
-    created_at_bytes.copy_from_slice(&suffix[..CREATED_AT_BYTES]);
-    let mut seq_bytes_be = [0u8; SEQ_BYTES];
-    seq_bytes_be.copy_from_slice(&suffix[CREATED_AT_BYTES..]);
-    let seq = u64::from_be_bytes(seq_bytes_be);
-    Ok((u64::from_be_bytes(created_at_bytes), seq.to_ne_bytes()))
 }
 
 /// Position a cursor at the last entry matching the prefix.

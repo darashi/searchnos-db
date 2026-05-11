@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use crate::nostr::{Event, Kind};
 use unicode_normalization::UnicodeNormalization;
@@ -69,52 +69,6 @@ pub fn normalize_query_terms(input: &str) -> Vec<String> {
         .collect()
 }
 
-/// Choose a minimum n-gram size for search queries based on the term length.
-pub fn preferred_min_query_ngram_size(term: &str) -> usize {
-    let len = term.chars().count();
-    len.clamp(MIN_NGRAM_SIZE, MAX_NGRAM_SIZE)
-}
-
-/// Default minimum and maximum character counts for generated n-grams.
-pub const MIN_NGRAM_SIZE: usize = 1;
-pub const MAX_NGRAM_SIZE: usize = 3;
-
-/// Build a deduplicated list of character n-grams within the provided bounds.
-pub fn char_ngrams(text: &str, min: usize, max: usize) -> Vec<String> {
-    if text.is_empty() || min == 0 || min > max {
-        return Vec::new();
-    }
-
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return Vec::new();
-    }
-
-    let mut uniques = BTreeSet::new();
-    let len = chars.len();
-
-    for n in min..=max {
-        if n == 0 {
-            continue;
-        }
-
-        if len < n {
-            continue;
-        }
-
-        for window in chars.windows(n) {
-            let gram: String = window.iter().collect();
-            uniques.insert(gram);
-        }
-    }
-
-    if uniques.is_empty() {
-        uniques.insert(chars.into_iter().collect());
-    }
-
-    uniques.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,15 +114,6 @@ mod tests {
     }
 
     #[test]
-    fn char_ngrams_generates_range() {
-        let grams = char_ngrams("abc", MIN_NGRAM_SIZE, MAX_NGRAM_SIZE);
-
-        assert!(grams.contains(&"a".to_string()));
-        assert!(grams.contains(&"ab".to_string()));
-        assert!(grams.contains(&"abc".to_string()));
-    }
-
-    #[test]
     fn normalize_text_converts_fullwidth_to_halfwidth() {
         let fullwidth = "！";
         let halfwidth = "!";
@@ -187,14 +132,5 @@ mod tests {
 
         assert_eq!(normalized, "wow!");
         assert!(normalized.contains("!"));
-    }
-
-    #[test]
-    fn preferred_min_query_ngram_size_scales_with_length() {
-        assert_eq!(preferred_min_query_ngram_size("h"), MIN_NGRAM_SIZE);
-        assert_eq!(preferred_min_query_ngram_size("hi"), 2);
-        assert_eq!(preferred_min_query_ngram_size("abc"), MAX_NGRAM_SIZE);
-        assert_eq!(preferred_min_query_ngram_size("rust"), MAX_NGRAM_SIZE);
-        assert_eq!(preferred_min_query_ngram_size("nostr"), MAX_NGRAM_SIZE);
     }
 }

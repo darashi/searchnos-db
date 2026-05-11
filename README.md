@@ -1,14 +1,14 @@
 # searchnos-db
 
-searchnos-db is a local LMDB-backed database designed for fast storage and retrieval of Nostr events. It provides normalized text search via n-gram indexes, several secondary indexes (event ID, pubkey, kind, tags, expiration), and tools to automatically purge expired data. The crate can be used both as a CLI utility and as a library embedding the database in your own application.
+searchnos-db is a local LMDB-backed database designed for storing and retrieving Nostr events. It keeps normalized event content for NIP-50 search, maintains the indexes needed for event identity, kind statistics, expiration, deletion markers, and replaceable events, and provides tools to automatically purge expired data. The crate can be used both as a CLI utility and as a library embedding the database in your own application.
 
 Events are serialized in a format that is (hopefully) compatible with `ndb_note` (v1) of [`nostrdb`](https://github.com/damus-io/nostrdb) when stored on disk.
 The overall layout takes cues from both [`strfry`](https://github.com/hoytech/strfry) and [`nostrdb`](https://github.com/damus-io/nostrdb).
-The main difference is an n-gram–based full-text search index.
+Text search is evaluated by scanning normalized event content.
 
 ## Highlights
 - **LMDB storage**: relies on a durable B+Tree datastore optimized for random access workloads.
-- **Rich indexing**: maintains secondary indexes for event IDs, authors, kinds, tags, n-grams, creation timestamps, and expiration timestamps.
+- **Focused indexing**: maintains indexes for event IDs, kinds, expiration timestamps, deletion markers, and replaceable-event slots.
 - **Text normalization**: normalizes Unicode text (NFKC), lowercases, and collapses whitespace to improve search quality.
 - **Expiration handling**: reads `expiration` tags and optional purge policies to drop stale events.
 - **Operational tooling**: ships with CLI subcommands for statistics, imports, dumps, and queries.

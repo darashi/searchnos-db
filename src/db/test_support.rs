@@ -1,18 +1,18 @@
 use std::convert::TryInto;
 
-use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, normalize_text};
+use crate::text::{extract_text, normalize_text};
 
 use super::{
     DumpProgress, LoadProgress, QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions,
-    Subscription, write::InsertResult,
+    Subscription, index::ContentsStore, write::InsertResult,
 };
 
 use crate::ndb_ext::from_ndb_note;
 use crate::nostr::{
-    Event, EventId, Filter, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp,
+    Event, EventId, Filter, JsonUtil, Kind, PublicKey, Timestamp,
     test_utils::{EventBuilder, Keys},
 };
-use lmdb::{Cursor, RoTransaction, Transaction};
+use lmdb::{RoTransaction, Transaction};
 use serde_json::to_string as to_json_string;
 
 pub(crate) struct TestDatabase {
@@ -112,6 +112,7 @@ impl TestDatabase {
 
     pub(crate) fn assert_event_stored(&self, txn: &RoTransaction<'_>, seq: u64, event: &Event) {
         let seq_bytes = seq.to_ne_bytes();
+        let content_key = ContentsStore::key(event.created_at.as_u64(), seq);
 
         let stored_event_bytes = txn
             .get(self.db.events, &seq_bytes)
@@ -122,7 +123,7 @@ impl TestDatabase {
         assert_eq!(stored_event.pubkey, event.pubkey);
 
         let stored_content_bytes = txn
-            .get(self.db.contents.database(), &seq_bytes)
+            .get(self.db.contents.database(), &content_key)
             .expect("content not stored");
         let stored_content = std::str::from_utf8(stored_content_bytes).expect("content not utf8");
         let extracted_content = extract_text(event);
@@ -135,71 +136,14 @@ impl TestDatabase {
         assert_eq!(index_seq, seq_bytes);
 
         assert!(
-            self.created_at_contains(txn, event.created_at.as_u64(), seq),
-            "created_at index missing seq {seq}"
-        );
-
-        assert!(
-            self.author_contains(txn, &event.pubkey, event.created_at.as_u64(), seq),
-            "author index missing seq {seq}"
-        );
-
-        assert!(
             self.kind_contains(txn, event.kind.as_u16(), event.created_at.as_u64(), seq),
             "kind index missing seq {seq}"
         );
-        assert!(
-            self.pubkey_kind_contains(
-                txn,
-                &event.pubkey,
-                event.kind.as_u16(),
-                event.created_at.as_u64(),
-                seq,
-            ),
-            "pubkey_kind index missing seq {seq}"
-        );
-
-        for gram in char_ngrams(stored_content, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
-            assert!(
-                self.ngram_contains(txn, &gram, event.created_at.as_u64(), seq),
-                "ngram index missing seq {seq} for gram '{gram}'"
-            );
-        }
-        for tag in event.tags.iter() {
-            let TagKind::SingleLetter(single) = tag.kind() else {
-                continue;
-            };
-            let Some(content) = tag.content() else {
-                continue;
-            };
-            if content.is_empty() {
-                continue;
-            }
-            assert!(
-                self.tag_contains(txn, single, content, event.created_at.as_u64(), seq),
-                "tag index missing seq {seq} for tag {}:{content}",
-                single
-            );
-        }
-    }
-
-    fn tag_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        tag: char,
-        value: &str,
-        _created_at: u64,
-        seq: u64,
-    ) -> bool {
-        self.db
-            .tag_index
-            .iter_candidates(txn, &[(tag, vec![value.to_string()])], None, None)
-            .expect("tag iterator failed")
-            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     pub(crate) fn assert_event_removed(&self, txn: &RoTransaction<'_>, seq: u64, event: &Event) {
         let seq_bytes = seq.to_ne_bytes();
+        let content_key = ContentsStore::key(event.created_at.as_u64(), seq);
         let index_key = Self::event_index_key(&event.id, event.created_at.as_u64());
 
         assert!(matches!(
@@ -207,7 +151,7 @@ impl TestDatabase {
             Err(lmdb::Error::NotFound)
         ));
         assert!(matches!(
-            txn.get(self.db.contents.database(), &seq_bytes),
+            txn.get(self.db.contents.database(), &content_key),
             Err(lmdb::Error::NotFound)
         ));
         assert!(matches!(
@@ -215,53 +159,9 @@ impl TestDatabase {
             Err(lmdb::Error::NotFound)
         ));
         assert!(
-            !self.created_at_contains(txn, event.created_at.as_u64(), seq),
-            "created_at index retained seq {seq}"
-        );
-
-        assert!(
-            !self.author_contains(txn, &event.pubkey, event.created_at.as_u64(), seq),
-            "author index retained seq {seq}"
-        );
-
-        assert!(
             !self.kind_contains(txn, event.kind.as_u16(), event.created_at.as_u64(), seq),
             "kind index retained seq {seq}"
         );
-        assert!(
-            !self.pubkey_kind_contains(
-                txn,
-                &event.pubkey,
-                event.kind.as_u16(),
-                event.created_at.as_u64(),
-                seq,
-            ),
-            "pubkey_kind index retained seq {seq}"
-        );
-
-        let normalized = normalize_text(&extract_text(event));
-        for gram in char_ngrams(&normalized, MIN_NGRAM_SIZE, MAX_NGRAM_SIZE) {
-            assert!(
-                !self.ngram_contains(txn, &gram, event.created_at.as_u64(), seq),
-                "ngram index retained seq {seq} for gram '{gram}'"
-            );
-        }
-        for tag in event.tags.iter() {
-            let TagKind::SingleLetter(single) = tag.kind() else {
-                continue;
-            };
-            let Some(content) = tag.content() else {
-                continue;
-            };
-            if content.is_empty() {
-                continue;
-            }
-            assert!(
-                !self.tag_contains(txn, single, content, event.created_at.as_u64(), seq),
-                "tag index retained seq {seq} for tag {}:{content}",
-                single
-            );
-        }
     }
 
     pub(crate) fn assert_deletion_marker_eq(
@@ -303,25 +203,6 @@ impl TestDatabase {
         ));
     }
 
-    pub(crate) fn created_at_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        created_at: u64,
-        seq: u64,
-    ) -> bool {
-        let mut cursor = txn
-            .open_ro_cursor(self.db.created_at_index.database())
-            .expect("failed to open created_at cursor");
-        let created_at_key = created_at.to_ne_bytes();
-        let seq_bytes = seq.to_ne_bytes();
-
-        match cursor.iter_dup_of(&created_at_key) {
-            Ok(mut iter) => iter.any(|(_, value)| value == seq_bytes),
-            Err(lmdb::Error::NotFound) => false,
-            Err(err) => panic!("unexpected cursor error: {err}"),
-        }
-    }
-
     pub(crate) fn kind_contains(
         &self,
         txn: &RoTransaction<'_>,
@@ -333,45 +214,6 @@ impl TestDatabase {
             .kind_index
             .iter_candidates(txn, &[kind], None, None)
             .expect("kind iterator failed")
-            .any(|candidate| candidate == seq.to_ne_bytes())
-    }
-
-    pub(crate) fn pubkey_kind_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        pubkey: &PublicKey,
-        kind: u16,
-        _created_at: u64,
-        seq: u64,
-    ) -> bool {
-        self.db
-            .pubkey_kind_index
-            .iter_candidates(txn, &[pubkey.as_bytes()], &[kind], None, None)
-            .expect("pubkey_kind iterator failed")
-            .any(|candidate| candidate == seq.to_ne_bytes())
-    }
-
-    fn ngram_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        gram: &str,
-        created_at: u64,
-        seq: u64,
-    ) -> bool {
-        self.db.ngram_index.contains(txn, gram, created_at, seq)
-    }
-
-    fn author_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        pubkey: &PublicKey,
-        _created_at: u64,
-        seq: u64,
-    ) -> bool {
-        self.db
-            .pubkey_index
-            .iter_candidates(txn, &[pubkey.as_bytes()], None, None)
-            .expect("author iterator failed")
             .any(|candidate| candidate == seq.to_ne_bytes())
     }
 

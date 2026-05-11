@@ -1,14 +1,15 @@
-use lmdb::{
-    Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
-    WriteFlags,
-};
+use lmdb::{Cursor, Database, DatabaseFlags, Environment, RwTransaction, WriteFlags};
+#[cfg(test)]
+use lmdb::{RoTransaction, Transaction};
+#[cfg(test)]
 use lmdb_sys::{MDB_GET_CURRENT, MDB_PREV};
 
-use super::common::{
-    append_created_at, position_cursor_at_prefix_end, put_keyed_seq, seq_from_value,
-    split_created_at_from_key,
-};
-use crate::db::{SEQ_BYTES, SearchnosDBError};
+use super::common::{append_created_at, put_keyed_seq};
+#[cfg(test)]
+use super::common::{position_cursor_at_prefix_end, seq_from_value, split_created_at_from_key};
+#[cfg(test)]
+use crate::db::SEQ_BYTES;
+use crate::db::SearchnosDBError;
 
 const KIND_BYTES: usize = std::mem::size_of::<u16>();
 
@@ -87,6 +88,7 @@ impl KindsIndex {
     }
 
     /// Iterate over all seq_bytes for the given kinds, honoring optional created_at bounds.
+    #[cfg(test)]
     pub fn iter_candidates<'env>(
         &self,
         txn: &'env RoTransaction<'env>,
