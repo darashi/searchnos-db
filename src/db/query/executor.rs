@@ -38,6 +38,23 @@ struct StreamingFilterStats {
     completed: bool,
 }
 
+struct StreamingQueryStats {
+    index_scan_duration: Duration,
+    filter_stats: Vec<StreamingFilterStats>,
+    completed: bool,
+}
+
+struct StreamingFilterState {
+    ndb_filter: NdbFilter,
+    match_opts: MatchEventOptions,
+    since: Option<u64>,
+    until: Option<u64>,
+    limit: Option<usize>,
+    matched_event_count: usize,
+    candidate_count: usize,
+    completed: bool,
+}
+
 impl SearchnosDB {
     pub(crate) fn to_ndb_filter(filter: &Filter, include_search: bool) -> NdbFilter {
         let ids = filter
@@ -111,8 +128,7 @@ impl SearchnosDB {
     /// Execute the provided filters and pass each matching event to `on_event`.
     ///
     /// Events are delivered in the same order as `query_with_stats`. Returning
-    /// `false` from `on_event` stops event delivery early, but the returned
-    /// stats still describe the completed index scan.
+    /// `false` from `on_event` stops event delivery and scanning early.
     pub fn stream_query_with_stats<F>(
         &self,
         filters_json: &str,
@@ -121,33 +137,14 @@ impl SearchnosDB {
     where
         F: FnMut(String) -> bool,
     {
-        if let Some(stats) = self.try_stream_query_incrementally(filters_json, &mut on_event)? {
-            return Ok(stats);
-        }
-
-        let QueryKeyResult {
-            txn,
-            keys,
-            total_start,
-            index_scan_duration,
-            post_processing_duration,
-            filter_stats,
-        } = self.query_keys(filters_json)?;
-        self.stream_event_keys_as_json(&txn, &keys, on_event)?;
-        let stats = Self::finish_query_stats(
-            total_start,
-            index_scan_duration,
-            post_processing_duration,
-            filter_stats,
-        );
-        Ok(stats)
+        self.stream_query_incrementally(filters_json, &mut on_event)
     }
 
-    fn try_stream_query_incrementally<F>(
+    fn stream_query_incrementally<F>(
         &self,
         filters_json: &str,
         on_event: &mut F,
-    ) -> Result<Option<QueryStats>, SearchnosDBError>
+    ) -> Result<QueryStats, SearchnosDBError>
     where
         F: FnMut(String) -> bool,
     {
@@ -155,20 +152,20 @@ impl SearchnosDB {
         let filters = Self::parse_filters_json(filters_json)?;
         let normalized_filters = self.normalized_filters_or_default(&filters);
 
-        if normalized_filters.len() != 1 {
-            return Ok(None);
-        }
-
         let txn = self.begin_ro_txn()?;
         let stream_stats =
-            self.stream_filter_events_as_json(&txn, &normalized_filters[0], on_event)?;
+            self.stream_filters_events_as_json(&txn, &normalized_filters, on_event)?;
 
-        let filter_stats = vec![FilterStats {
-            index_scan_duration: stream_stats.index_scan_duration,
-            post_processing_duration: Duration::default(),
-            matched_event_count: stream_stats.matched_event_count,
-            candidate_count: stream_stats.candidate_count,
-        }];
+        let filter_stats = stream_stats
+            .filter_stats
+            .into_iter()
+            .map(|stats| FilterStats {
+                index_scan_duration: stats.index_scan_duration,
+                post_processing_duration: Duration::default(),
+                matched_event_count: stats.matched_event_count,
+                candidate_count: stats.candidate_count,
+            })
+            .collect();
         let total_elapsed = total_start.elapsed();
         let stats = QueryStats {
             total_elapsed,
@@ -181,7 +178,7 @@ impl SearchnosDB {
             filters: filter_stats,
         };
 
-        Ok(Some(stats))
+        Ok(stats)
     }
 
     /// Execute the provided filters and stream matching events without timing stats.
@@ -488,6 +485,190 @@ impl SearchnosDB {
         })
     }
 
+    fn stream_filters_events_as_json<'env, F>(
+        &self,
+        txn: &'env RoTransaction<'env>,
+        filters: &[Filter],
+        mut on_event: F,
+    ) -> Result<StreamingQueryStats, SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        if filters.len() == 1 {
+            let stats = self.stream_filter_events_as_json(txn, &filters[0], on_event)?;
+            let completed = stats.completed;
+            return Ok(StreamingQueryStats {
+                index_scan_duration: stats.index_scan_duration,
+                filter_stats: vec![stats],
+                completed,
+            });
+        }
+
+        let index_start = Instant::now();
+        let mut states = filters
+            .iter()
+            .map(Self::streaming_filter_state)
+            .collect::<Vec<_>>();
+        let start_until = Self::streaming_start_until(&states);
+        let mut cursor = txn.open_ro_cursor(self.contents.database())?;
+        let mut positioned = ContentsStore::position_cursor(&mut cursor, start_until)?;
+        let mut seen = HashSet::new();
+        let mut completed = true;
+
+        while positioned && states.iter().any(|state| !state.completed) {
+            let (contents_key, content_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(key), value)) => (key, value),
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            };
+
+            let (created_at, seq_bytes) = ContentsStore::split_key(contents_key)?;
+            let eligible = Self::mark_streaming_candidates(&mut states, created_at);
+
+            if !eligible {
+                // TODO: Jump to the next active filter's `until` boundary when all
+                // filters skip the current created_at range. This keeps correctness
+                // simple for now, but sparse disjoint ranges still walk index rows
+                // between filter windows.
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+                continue;
+            }
+
+            let event_bytes = txn.get(self.events, &seq_bytes)?;
+            let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+            let expired = extract_note_expiration(&note).is_some_and(|expiration| {
+                !Self::note_is_ephemeral(&note) && Self::is_expired(expiration)
+            });
+
+            let mut should_deliver = false;
+            if !expired {
+                for state in states.iter_mut().filter(|state| !state.completed) {
+                    if !Self::streaming_filter_covers_created_at(state, created_at) {
+                        continue;
+                    }
+
+                    if note_matches_filter(
+                        &note,
+                        &state.ndb_filter,
+                        state.match_opts,
+                        content_bytes,
+                    ) {
+                        state.matched_event_count = state.matched_event_count.saturating_add(1);
+                        should_deliver = true;
+
+                        if let Some(limit) = state.limit
+                            && state.matched_event_count >= limit
+                        {
+                            state.completed = true;
+                        }
+                    }
+                }
+            }
+
+            if should_deliver && seen.insert(seq_bytes) {
+                let event_json =
+                    from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+                if !on_event(event_json) {
+                    completed = false;
+                    break;
+                }
+            }
+
+            positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+        }
+
+        let index_scan_duration = index_start.elapsed();
+        let filter_stats = states
+            .into_iter()
+            .map(|state| StreamingFilterStats {
+                index_scan_duration,
+                matched_event_count: state.matched_event_count,
+                candidate_count: state.candidate_count,
+                completed: state.completed,
+            })
+            .collect();
+
+        Ok(StreamingQueryStats {
+            index_scan_duration,
+            filter_stats,
+            completed,
+        })
+    }
+
+    fn streaming_filter_state(filter: &Filter) -> StreamingFilterState {
+        let search_terms = filter
+            .search
+            .as_ref()
+            .map(|search| normalize_query_terms(search));
+        let completed =
+            matches!(filter.limit, Some(0)) || search_terms.as_ref().is_some_and(Vec::is_empty);
+        let match_opts = MatchEventOptions::new().nip50(search_terms.is_some());
+
+        StreamingFilterState {
+            ndb_filter: Self::to_ndb_filter(filter, match_opts.nip50),
+            match_opts,
+            since: filter.since.map(|ts| ts.as_u64()),
+            until: filter.until.map(|ts| ts.as_u64()),
+            limit: filter.limit.filter(|&limit| limit > 0),
+            matched_event_count: 0,
+            candidate_count: 0,
+            completed,
+        }
+    }
+
+    fn streaming_start_until(states: &[StreamingFilterState]) -> Option<u64> {
+        if states
+            .iter()
+            .any(|state| !state.completed && state.until.is_none())
+        {
+            None
+        } else {
+            states
+                .iter()
+                .filter(|state| !state.completed)
+                .filter_map(|state| state.until)
+                .max()
+        }
+    }
+
+    fn mark_streaming_candidates(states: &mut [StreamingFilterState], created_at: u64) -> bool {
+        let mut eligible = false;
+
+        for state in states.iter_mut().filter(|state| !state.completed) {
+            if let Some(since) = state.since
+                && created_at < since
+            {
+                state.completed = true;
+                continue;
+            }
+
+            if !Self::streaming_filter_covers_created_at(state, created_at) {
+                continue;
+            }
+
+            state.candidate_count = state.candidate_count.saturating_add(1);
+            eligible = true;
+        }
+
+        eligible
+    }
+
+    fn streaming_filter_covers_created_at(state: &StreamingFilterState, created_at: u64) -> bool {
+        if let Some(until) = state.until
+            && created_at > until
+        {
+            return false;
+        }
+
+        if let Some(since) = state.since
+            && created_at < since
+        {
+            return false;
+        }
+
+        true
+    }
+
     fn move_contents_cursor_prev(cursor: &mut RoCursor<'_>) -> Result<bool, SearchnosDBError> {
         match cursor.get(None, None, MDB_PREV) {
             Ok(_) => Ok(true),
@@ -519,25 +700,5 @@ impl SearchnosDB {
         }
 
         Ok(events)
-    }
-
-    fn stream_event_keys_as_json<'env, F>(
-        &self,
-        txn: &'env RoTransaction<'env>,
-        keys: &[[u8; SEQ_BYTES]],
-        mut on_event: F,
-    ) -> Result<(), SearchnosDBError>
-    where
-        F: FnMut(String) -> bool,
-    {
-        for key in keys {
-            let event_bytes = txn.get(self.events, key)?;
-            let event_json = from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-            if !on_event(event_json) {
-                break;
-            }
-        }
-
-        Ok(())
     }
 }

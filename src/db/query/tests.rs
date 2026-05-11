@@ -185,6 +185,63 @@ fn query_deduplicates_results_from_multiple_filters() {
 }
 
 #[test]
+fn stream_query_deduplicates_results_from_multiple_filters() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let earlier = EventBuilder::text_note("first")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build earlier event");
+    let later = EventBuilder::text_note("second")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build later event");
+
+    db.insert(&earlier);
+    db.insert(&later);
+
+    let filters = vec![
+        Filter::new().id(later.id),
+        Filter::new().author(keys.public_key()),
+    ];
+
+    let results = db.stream_query(&filters);
+
+    assert_eq!(results, vec![later.as_json(), earlier.as_json()]);
+}
+
+#[test]
+fn stream_query_stops_scanning_multiple_filters_when_delivery_stops() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let first = EventBuilder::text_note("first")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build first event");
+    let second = EventBuilder::text_note("second")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build second event");
+
+    db.insert(&first);
+    db.insert(&second);
+
+    let filters = vec![
+        Filter::new().id(first.id),
+        Filter::new().author(keys.public_key()),
+    ];
+    let result = db.stream_query_with_stats_until(&filters, 1);
+
+    assert_eq!(result.events, vec![first.as_json()]);
+    assert_eq!(result.stats.filters[0].candidate_count, 1);
+    assert_eq!(result.stats.filters[0].matched_event_count, 1);
+    assert_eq!(result.stats.filters[1].candidate_count, 1);
+    assert_eq!(result.stats.filters[1].matched_event_count, 1);
+}
+
+#[test]
 fn query_applies_search_terms_to_normalized_content() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
