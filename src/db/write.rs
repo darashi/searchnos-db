@@ -75,6 +75,17 @@ enum ExistingEventResult {
 
 impl SearchnosDB {
     pub(crate) fn prepare_insert(raw: &str) -> Result<PreparedInsert, SearchnosDBError> {
+        Self::prepare_insert_with_options(raw, true)
+    }
+
+    pub(crate) fn prepare_insert_for_load(raw: &str) -> Result<PreparedInsert, SearchnosDBError> {
+        Self::prepare_insert_with_options(raw, false)
+    }
+
+    fn prepare_insert_with_options(
+        raw: &str,
+        reject_invalid_replace_deletions: bool,
+    ) -> Result<PreparedInsert, SearchnosDBError> {
         let event = Event::from_json(raw)?;
         event.verify().map_err(SearchnosDBError::InvalidSignature)?;
         let index_data = EventIndexData::from_event(&event);
@@ -86,7 +97,7 @@ impl SearchnosDB {
             Vec::new()
         };
         let replace_deletions = if is_deletion {
-            Self::collect_replace_deletions(&event)?
+            Self::collect_replace_deletions(&event, reject_invalid_replace_deletions)?
         } else {
             Vec::new()
         };
@@ -169,6 +180,24 @@ impl SearchnosDB {
         self.broadcast_note(&note, &prepared.index_data.normalized_content, &event_json);
 
         Ok(InsertResult::Inserted(seq))
+    }
+
+    pub(crate) fn load_event_json_immediate_owned(
+        &self,
+        event_json: String,
+    ) -> Result<InsertResult, SearchnosDBError> {
+        let prepared = Self::prepare_insert_for_load(&event_json)?;
+        self.insert_prepared_immediate(prepared)
+    }
+
+    fn insert_prepared_immediate(
+        &self,
+        prepared: PreparedInsert,
+    ) -> Result<InsertResult, SearchnosDBError> {
+        let mut txn = self.begin_rw_txn()?;
+        let result = self.insert_prepared(&mut txn, prepared)?;
+        txn.commit().map_err(SearchnosDBError::from)?;
+        Ok(result)
     }
 
     fn validate_event_for_insertion(
@@ -412,6 +441,7 @@ impl SearchnosDB {
 
     fn collect_replace_deletions(
         event: &Event,
+        reject_invalid: bool,
     ) -> Result<Vec<ReplaceDeletionTarget>, SearchnosDBError> {
         let mut targets = Vec::new();
         for tag in event.tags.iter() {
@@ -422,14 +452,23 @@ impl SearchnosDB {
                 continue;
             }
             let Some(a_tag) = tag.content() else {
+                if !reject_invalid {
+                    continue;
+                }
                 return Err(SearchnosDBError::InvalidDeletionATag(
                     "missing coordinate".to_string(),
                 ));
             };
             let Some((kind, pubkey, d_tag)) = parse_a_tag(a_tag) else {
+                if !reject_invalid {
+                    continue;
+                }
                 return Err(SearchnosDBError::InvalidDeletionATag(a_tag.to_string()));
             };
             if pubkey != *event.pubkey.as_bytes() {
+                if !reject_invalid {
+                    continue;
+                }
                 return Err(SearchnosDBError::InvalidDeletionATag(
                     "cannot delete another pubkey's addressable event".to_string(),
                 ));

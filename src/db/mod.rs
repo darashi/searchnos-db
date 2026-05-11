@@ -436,6 +436,8 @@ impl SearchnosDB {
         let mut count = 0u64;
         let mut bytes_read = 0u64;
 
+        self.flush()?;
+
         loop {
             let Some(len) = Self::read_dump_record_length(&mut reader)? else {
                 break;
@@ -447,7 +449,7 @@ impl SearchnosDB {
             bytes_read += u64::from(len);
 
             let event_json = from_ndb_note(&payload).map_err(SearchnosDBError::DecodeEvent)?;
-            self.insert_event_json_owned(event_json)?;
+            self.load_event_json_immediate_owned(event_json)?;
             count += 1;
             on_progress(LoadProgress {
                 events_loaded: count,
@@ -455,7 +457,6 @@ impl SearchnosDB {
             });
         }
 
-        self.flush()?;
         Ok(count)
     }
 
@@ -534,6 +535,7 @@ mod tests {
         PurgePolicy, SearchnosDBError, SearchnosDBOptions, StreamItem, Subscription,
         test_support::TestDatabase,
     };
+    use crate::ndb_ext::to_ndb_note;
     use crate::nostr::{
         Event, EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, PublicKey, Timestamp,
         test_utils::{EventBuilder, Keys},
@@ -686,6 +688,44 @@ mod tests {
 
         let loaded_events = destination.query(&[Filter::new().search("loaded")]);
         assert_eq!(loaded_events.len(), 2);
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].events_loaded, 1);
+        assert_eq!(progress[1].events_loaded, 2);
+        assert_eq!(progress[1].bytes_read as usize, dumped.len());
+    }
+
+    #[test]
+    fn load_events_stores_invalid_a_tag_deletions_without_applying_them() {
+        let keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let valid = EventBuilder::text_note("valid loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build valid event");
+        let invalid_deletion = EventBuilder::new(Kind::EventDeletion, "invalid")
+            .tag(addressable_tag(
+                Kind::LongFormTextNote,
+                other_keys.public_key(),
+                "slot",
+            ))
+            .custom_created_at(Timestamp::from_secs(6_000))
+            .sign_with_keys(&keys)
+            .expect("failed to build invalid deletion event");
+        assert!(matches!(
+            TestDatabase::new().insert_error(&invalid_deletion),
+            SearchnosDBError::InvalidDeletionATag(_)
+        ));
+
+        let mut dumped = Vec::new();
+        append_dump_record(&mut dumped, &valid);
+        append_dump_record(&mut dumped, &invalid_deletion);
+
+        let destination = TestDatabase::new();
+        let progress = destination.load_events_with_progress(&dumped);
+
+        let loaded_events = destination.query(&[Filter::new().search("loaded")]);
+        assert_eq!(loaded_events, vec![valid.as_json()]);
+        let loaded_deletions = destination.query(&[Filter::new().id(invalid_deletion.id)]);
+        assert_eq!(loaded_deletions, vec![invalid_deletion.as_json()]);
         assert_eq!(progress.len(), 2);
         assert_eq!(progress[0].events_loaded, 1);
         assert_eq!(progress[1].events_loaded, 2);
@@ -1248,6 +1288,13 @@ mod tests {
             "a".to_string(),
             format!("{}:{}:{d_tag}", kind.as_u32(), pubkey.to_hex()),
         ]
+    }
+
+    fn append_dump_record(out: &mut Vec<u8>, event: &Event) {
+        let payload = to_ndb_note(&event.as_json()).expect("failed to encode ndb note");
+        let len = u32::try_from(payload.len()).expect("payload too large");
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&payload);
     }
 
     /// Helper function for polling subscription with timeout
