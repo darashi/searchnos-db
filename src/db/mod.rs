@@ -4,8 +4,9 @@ use lmdb::{
 
 use crate::nostr::{EventError, Filter};
 use serde_json::{Map, Value};
-use std::sync::Arc;
+use std::io::Write;
 use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
+use std::{mem, sync::Arc};
 
 use tokio::task::JoinError;
 
@@ -56,6 +57,7 @@ const DEFAULT_MAP_SIZE: usize = 1usize << 40; // 1 TiB
 const SEQ_BYTES: usize = std::mem::size_of::<u64>();
 const CREATED_AT_BYTES: usize = std::mem::size_of::<u64>();
 const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
+const DUMP_LENGTH_PREFIX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
 use index::{
     ContentsStore, CreatedAtIndex, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex,
@@ -120,6 +122,8 @@ pub enum SearchnosDBError {
     InvalidCreatedAtLength(usize),
     #[error("unexpected expiration length: expected {EXPIRATION_BYTES} bytes, got {0}")]
     InvalidExpirationLength(usize),
+    #[error("event payload length exceeds u32: {0} bytes")]
+    EventPayloadTooLarge(usize),
     #[error("normalized content is not valid UTF-8: {0}")]
     InvalidUtf8Content(#[from] std::str::Utf8Error),
     #[error("batch state is poisoned")]
@@ -135,6 +139,13 @@ pub struct DatabaseStats {
     pub key_bytes: usize,
     pub value_bytes: usize,
     pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DumpProgress {
+    pub events_written: u64,
+    pub total_events: u64,
+    pub bytes_written: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +414,64 @@ impl SearchnosDB {
         Ok(stats.into_values().collect())
     }
 
+    /// Write stored ndb notes as repeated `(u32 length, payload)` records.
+    ///
+    /// The length prefix is encoded as big-endian bytes. Payload bytes are the
+    /// ndb note bytes stored in the `events` database.
+    pub fn dump_events<W: Write>(&self, writer: W) -> Result<u64, SearchnosDBError> {
+        self.dump_events_with_progress(writer, |_| {})
+    }
+
+    /// Write stored ndb notes and report progress after each record is written.
+    ///
+    /// `total_events` is the number of events visible in the read transaction
+    /// used for this dump.
+    pub fn dump_events_with_progress<W, F>(
+        &self,
+        mut writer: W,
+        mut on_progress: F,
+    ) -> Result<u64, SearchnosDBError>
+    where
+        W: Write,
+        F: FnMut(DumpProgress),
+    {
+        self.flush()?;
+
+        let txn = self.begin_ro_txn()?;
+        let total_events = Self::database_entry_count(&txn, self.events)?;
+        let mut cursor = txn.open_ro_cursor(self.events)?;
+        let mut count = 0u64;
+        let mut bytes_written = 0u64;
+
+        for (_, payload) in cursor.iter() {
+            let len = u32::try_from(payload.len())
+                .map_err(|_| SearchnosDBError::EventPayloadTooLarge(payload.len()))?;
+            writer.write_all(&len.to_be_bytes())?;
+            writer.write_all(payload)?;
+            count += 1;
+            bytes_written += DUMP_LENGTH_PREFIX_BYTES + u64::from(len);
+            on_progress(DumpProgress {
+                events_written: count,
+                total_events,
+                bytes_written,
+            });
+        }
+
+        Ok(count)
+    }
+
+    fn database_entry_count<T>(txn: &T, database: Database) -> Result<u64, SearchnosDBError>
+    where
+        T: Transaction,
+    {
+        let mut stat = unsafe { mem::zeroed::<lmdb_sys::MDB_stat>() };
+        let rc = unsafe { lmdb_sys::mdb_stat(txn.txn(), database.dbi(), &mut stat) };
+        if rc != 0 {
+            return Err(lmdb::Error::from_err_code(rc).into());
+        }
+        Ok(stat.ms_entries as u64)
+    }
+
     /// Enqueue an event for insertion from borrowed JSON data.
     pub fn insert_event_json(&self, event_json: &str) -> Result<(), SearchnosDBError> {
         self.insert_event_json_owned(event_json.to_owned())
@@ -447,7 +516,7 @@ mod tests {
         test_support::TestDatabase,
     };
     use crate::nostr::{
-        EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, Timestamp,
+        Event, EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, Timestamp,
         test_utils::{EventBuilder, Keys},
     };
 
@@ -527,6 +596,55 @@ mod tests {
 
         let txn = db.ro_txn();
         db.assert_event_stored(&txn, seq, &event);
+    }
+
+    #[test]
+    fn dump_events_writes_length_prefixed_ndb_notes() {
+        let db = TestDatabase::new();
+        let keys = Keys::generate();
+        let first = EventBuilder::text_note("first dumped note")
+            .sign_with_keys(&keys)
+            .expect("failed to build first event");
+        let second = EventBuilder::text_note("second dumped note")
+            .sign_with_keys(&keys)
+            .expect("failed to build second event");
+
+        db.insert(&first);
+        db.insert(&second);
+
+        let plain_dumped = db.dump_events();
+        let (dumped, progress) = db.dump_events_with_progress();
+        assert_eq!(plain_dumped, dumped);
+
+        let mut remaining = dumped.as_slice();
+        let mut dumped_events = Vec::new();
+
+        while !remaining.is_empty() {
+            let (len_bytes, rest) = remaining
+                .split_first_chunk::<4>()
+                .expect("dump record missing length");
+            let len = u32::from_be_bytes(*len_bytes) as usize;
+            assert!(
+                rest.len() >= len,
+                "dump record payload shorter than length prefix"
+            );
+            let (payload, rest) = rest.split_at(len);
+            let event_json = crate::ndb_ext::from_ndb_note(payload).expect("invalid ndb note");
+            dumped_events.push(
+                Event::from_json(&event_json).expect("dumped ndb note contained invalid event"),
+            );
+            remaining = rest;
+        }
+
+        assert_eq!(dumped_events.len(), 2);
+        assert_eq!(dumped_events[0].id, first.id);
+        assert_eq!(dumped_events[1].id, second.id);
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].events_written, 1);
+        assert_eq!(progress[0].total_events, 2);
+        assert_eq!(progress[1].events_written, 2);
+        assert_eq!(progress[1].total_events, 2);
+        assert_eq!(progress[1].bytes_written as usize, dumped.len());
     }
 
     #[test]

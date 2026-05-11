@@ -11,7 +11,7 @@ The main difference is an n-gram–based full-text search index.
 - **Rich indexing**: maintains secondary indexes for event IDs, authors, kinds, tags, n-grams, creation timestamps, and expiration timestamps.
 - **Text normalization**: normalizes Unicode text (NFKC), lowercases, and collapses whitespace to improve search quality.
 - **Expiration handling**: reads `expiration` tags and optional purge policies to drop stale events.
-- **Operational tooling**: ships with CLI subcommands for statistics, imports, and queries.
+- **Operational tooling**: ships with CLI subcommands for statistics, imports, dumps, and queries.
 
 > ⚠️ **Stability notice:** searchnos-db is under active development. Public interfaces may change without prior notice, and on-disk storage formats are not guaranteed to remain compatible between releases.
 
@@ -46,6 +46,15 @@ cargo run -- import ./events-a.jsonl ./events-b.jsonl --db-path ./data
 ```
 Reads newline-delimited JSON and inserts events with a progress bar. Multiple files are processed sequentially, and blank lines are skipped.
 
+### Dump events
+```bash
+cargo run -- dump ./events.dump --db-path ./data
+```
+Writes all stored `ndb_note` payloads to a binary dump file with a progress bar. The dump format is a repeated sequence of:
+
+1. 4-byte unsigned payload length encoded as big-endian `u32`
+2. Raw `ndb_note` payload bytes of that length
+
 ### Query events
 ```bash
 cargo run -- query '{"authors": ["<hex pubkey>"], "kinds": [1]}'
@@ -65,6 +74,28 @@ let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":
 db.insert_event_json(raw_event)?;
 
 db.flush()?; // ensure pending batches are written
+```
+
+### Dump from Rust
+Use `dump_events` when the caller only needs the serialized stream, or `dump_events_with_progress` when the caller wants to report progress. The crate writes to any `std::io::Write`, so file creation, compression, or network transport can remain the caller's responsibility.
+
+```rust
+use searchnos_db::{DumpProgress, SearchnosDB};
+use std::fs::File;
+use std::io::BufWriter;
+
+let db = SearchnosDB::open("./data")?;
+let file = File::create("./events.dump")?;
+let writer = BufWriter::new(file);
+
+db.dump_events_with_progress(writer, |progress: DumpProgress| {
+    eprintln!(
+        "dumped {}/{} events ({} bytes)",
+        progress.events_written,
+        progress.total_events,
+        progress.bytes_written,
+    );
+})?;
 ```
 
 Refer to the Rustdoc comments for details on purge policies, index behavior, and the embedded `ndb` format helpers.

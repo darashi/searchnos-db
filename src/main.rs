@@ -19,6 +19,12 @@ struct Cli {
 enum Command {
     /// Display database statistics
     Stat,
+    /// Dump stored ndb notes as length-prefixed binary records
+    Dump {
+        /// Path to the output dump file
+        #[arg(value_name = "FILE", value_hint = ValueHint::FilePath)]
+        output_path: PathBuf,
+    },
     /// Print events as JSON
     Query {
         /// Filter(s) as JSON: accepts an object for a single filter or an array for multiple
@@ -54,6 +60,7 @@ fn run() -> Result<(), CliError> {
 
     match command {
         Command::Stat => cmd::stat::run(&db_path),
+        Command::Dump { output_path } => cmd::dump::run(&db_path, &output_path),
         Command::Query { filters } => cmd::query::run(&db_path, filters),
         Command::Import {
             import_paths,

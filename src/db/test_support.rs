@@ -3,7 +3,8 @@ use std::convert::TryInto;
 use crate::text::{MAX_NGRAM_SIZE, MIN_NGRAM_SIZE, char_ngrams, extract_text, normalize_text};
 
 use super::{
-    QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription, write::InsertResult,
+    DumpProgress, QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions, Subscription,
+    write::InsertResult,
 };
 
 use crate::ndb_ext::from_ndb_note;
@@ -73,6 +74,21 @@ impl TestDatabase {
     pub(crate) fn query_with_stats(&self, filters: &[Filter]) -> QueryResult {
         let json = to_json_string(filters).expect("failed to encode filters");
         self.db.query_with_stats(&json).expect("query failed")
+    }
+
+    pub(crate) fn dump_events(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.db.dump_events(&mut bytes).expect("dump failed");
+        bytes
+    }
+
+    pub(crate) fn dump_events_with_progress(&self) -> (Vec<u8>, Vec<DumpProgress>) {
+        let mut bytes = Vec::new();
+        let mut progress = Vec::new();
+        self.db
+            .dump_events_with_progress(&mut bytes, |item| progress.push(item))
+            .expect("dump failed");
+        (bytes, progress)
     }
 
     pub(crate) fn subscribe(&self, filters: &[Filter]) -> Subscription {

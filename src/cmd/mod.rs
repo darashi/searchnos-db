@@ -1,6 +1,7 @@
 use indicatif::{ProgressState, ProgressStyle};
 use std::fmt::Write;
 
+pub mod dump;
 pub mod import;
 pub mod query;
 pub mod stat;
