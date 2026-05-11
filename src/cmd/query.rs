@@ -47,8 +47,7 @@ fn report_stats(result: &searchnos_db::QueryResult) {
 
     for (idx, filter_stats) in stats.filters.iter().enumerate() {
         eprintln!(
-            "  filter #{idx}: {:?} (index: {:.3} ms, post: {:.3} ms, candidates: {}, matches: {})",
-            filter_stats.plan.source,
+            "  filter #{idx}: index: {:.3} ms, post: {:.3} ms, candidates: {}, matches: {}",
             duration_ms(filter_stats.index_scan_duration),
             duration_ms(filter_stats.post_processing_duration),
             filter_stats.candidate_count,

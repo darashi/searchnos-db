@@ -29,70 +29,6 @@ fn add_pubkey(filter: Filter, pubkey: PublicKey) -> Filter {
 }
 
 #[test]
-fn query_plan_uses_contents_scan_when_ids_specified() {
-    let filter = Filter::new().id(EventId::from([0u8; 32]));
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-    assert!(plan.match_opts.id);
-}
-
-#[test]
-fn query_plan_defaults_to_contents_scan_without_ids() {
-    let filter = Filter::new();
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-    assert!(plan.match_opts.id);
-    assert!(!plan.match_opts.nip50);
-}
-
-#[test]
-fn query_plan_checks_search_terms_during_contents_scan() {
-    let filter = Filter::new().search("rustacean");
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-    assert!(plan.match_opts.id);
-    assert!(plan.match_opts.nip50);
-}
-
-#[test]
-fn query_plan_uses_contents_scan_when_authors_specified() {
-    let keys = Keys::generate();
-    let filter = Filter::new().author(keys.public_key());
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-}
-
-#[test]
-fn query_plan_uses_contents_scan_when_kinds_specified() {
-    let filter = Filter::new().kind(Kind::LongFormTextNote);
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-}
-
-#[test]
-fn query_plan_uses_contents_scan_when_author_and_kind_filters_specified() {
-    let keys = Keys::generate();
-    let filter = Filter::new().author(keys.public_key()).kind(Kind::TextNote);
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-}
-
-#[test]
-fn query_plan_uses_contents_scan_when_tags_specified() {
-    let filter = filter_with_hashtag("nostr");
-    let plan = super::QueryPlan::for_filter(&filter);
-
-    assert!(matches!(plan.source, super::PlanSource::ContentsScan));
-    assert!(!plan.match_opts.nip50);
-}
-
-#[test]
 fn query_without_filters_orders_by_created_at_desc() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
@@ -471,7 +407,7 @@ fn query_clamps_limit_to_max_limit() {
 }
 
 #[test]
-fn query_contents_scan_prefers_newest_with_limit() {
+fn query_prefers_newest_with_limit() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -988,11 +924,11 @@ fn query_omits_events_removed_by_deletion_request() {
 }
 
 #[test]
-fn query_with_stats_reports_plan_details() {
+fn query_with_stats_reports_filter_details() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
-    let event = EventBuilder::text_note("plan timing")
+    let event = EventBuilder::text_note("stats timing")
         .sign_with_keys(&keys)
         .expect("failed to build event");
     db.insert(&event);
@@ -1005,14 +941,10 @@ fn query_with_stats_reports_plan_details() {
     assert!(result.stats.total_elapsed >= result.stats.index_scan_duration);
     assert!(result.stats.total_elapsed >= result.stats.post_processing_duration);
     assert!(result.stats.filters[0].candidate_count >= result.stats.filters[0].matched_event_count);
-    assert!(matches!(
-        result.stats.filters[0].plan.source,
-        super::PlanSource::ContentsScan
-    ));
 }
 
 #[test]
-fn query_contents_scan_stops_at_since_bound() {
+fn query_stops_at_since_bound() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 
@@ -1041,7 +973,7 @@ fn query_contents_scan_stops_at_since_bound() {
 }
 
 #[test]
-fn query_contents_scan_starts_at_until_bound() {
+fn query_starts_at_until_bound() {
     let db = TestDatabase::new();
     let keys = Keys::generate();
 

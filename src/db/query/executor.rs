@@ -11,13 +11,13 @@ use ndb::NdbNote;
 use crate::nostr::{Filter, Kind, extract_note_expiration};
 
 use crate::db::{
-    FilterPlanStats, QueryResult, QueryStats, SEQ_BYTES, SearchnosDB, SearchnosDBError,
+    FilterStats, QueryResult, QueryStats, SEQ_BYTES, SearchnosDB, SearchnosDBError,
     index::ContentsStore,
 };
-use crate::ndb_ext::{NdbFilter, from_ndb_note, note_matches_filter};
+use crate::ndb_ext::{MatchEventOptions, NdbFilter, from_ndb_note, note_matches_filter};
 use crate::text::normalize_query_terms;
 
-struct PlanCollectionResult {
+struct FilterCollectionResult {
     keys: Vec<(u64, [u8; SEQ_BYTES])>,
     candidate_count: usize,
 }
@@ -122,10 +122,9 @@ impl SearchnosDB {
         filter: &Filter,
         seen: &mut HashSet<[u8; SEQ_BYTES]>,
         entries: &mut Vec<(u64, [u8; SEQ_BYTES])>,
-    ) -> Result<FilterPlanStats, SearchnosDBError> {
-        let plan = super::QueryPlan::for_filter(filter);
+    ) -> Result<FilterStats, SearchnosDBError> {
         let index_start = Instant::now();
-        let mut collection = self.collect_event_keys_for_plan(txn, filter, &plan)?;
+        let mut collection = self.collect_event_keys_for_filter(txn, filter)?;
         let index_scan_duration = index_start.elapsed();
 
         let post_start = Instant::now();
@@ -137,8 +136,7 @@ impl SearchnosDB {
         }
         let post_processing_duration = post_start.elapsed();
 
-        Ok(FilterPlanStats {
-            plan,
+        Ok(FilterStats {
             index_scan_duration,
             post_processing_duration,
             matched_event_count,
@@ -146,14 +144,13 @@ impl SearchnosDB {
         })
     }
 
-    fn collect_event_keys_for_plan<'env>(
+    fn collect_event_keys_for_filter<'env>(
         &self,
         txn: &'env RoTransaction<'env>,
         filter: &Filter,
-        plan: &super::QueryPlan,
-    ) -> Result<PlanCollectionResult, SearchnosDBError> {
+    ) -> Result<FilterCollectionResult, SearchnosDBError> {
         if matches!(filter.limit, Some(0)) {
-            return Ok(PlanCollectionResult {
+            return Ok(FilterCollectionResult {
                 keys: Vec::new(),
                 candidate_count: 0,
             });
@@ -165,24 +162,20 @@ impl SearchnosDB {
             .map(|search| normalize_query_terms(search));
 
         if search_terms.as_ref().is_some_and(|terms| terms.is_empty()) {
-            return Ok(PlanCollectionResult {
+            return Ok(FilterCollectionResult {
                 keys: Vec::new(),
                 candidate_count: 0,
             });
         }
 
-        // Only include search in ndb_filter if it will be checked (nip50 == true)
-        let ndb_filter = Self::to_ndb_filter(filter, plan.match_opts.nip50);
+        let match_opts = MatchEventOptions::new().nip50(search_terms.is_some());
+        let ndb_filter = Self::to_ndb_filter(filter, match_opts.nip50);
         // Apply unified filtering logic over normalized content rows.
         let mut keys = Vec::new();
         let mut candidate_count = 0usize;
         let since = filter.since.map(|ts| ts.as_u64());
         let until = filter.until.map(|ts| ts.as_u64());
-        let early_exit_limit = if plan.source.produces_descending_created_at() {
-            filter.limit.filter(|&limit| limit > 0)
-        } else {
-            None
-        };
+        let early_exit_limit = filter.limit.filter(|&limit| limit > 0);
         let mut cursor = txn.open_ro_cursor(self.contents.database())?;
         let mut positioned = ContentsStore::position_cursor(&mut cursor, until)?;
 
@@ -213,7 +206,7 @@ impl SearchnosDB {
             let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
 
             // Check all filter conditions
-            if !note_matches_filter(&note, &ndb_filter, plan.match_opts, content_bytes) {
+            if !note_matches_filter(&note, &ndb_filter, match_opts, content_bytes) {
                 positioned = Self::move_contents_cursor_prev(&mut cursor)?;
                 continue;
             }
@@ -247,7 +240,7 @@ impl SearchnosDB {
             keys.truncate(limit);
         }
 
-        Ok(PlanCollectionResult {
+        Ok(FilterCollectionResult {
             keys,
             candidate_count,
         })

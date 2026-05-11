@@ -3,9 +3,8 @@ mod ndb_ext;
 pub mod nostr;
 mod text;
 
-pub use db::query::{PlanSource, QueryPlan};
 pub use db::{
-    DatabaseStats, DumpProgress, FilterPlanStats, LoadProgress, PurgePolicy, PurgeSpecError,
+    DatabaseStats, DumpProgress, FilterStats, LoadProgress, PurgePolicy, PurgeSpecError,
     QueryResult, QueryStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem,
     Subscription, SubscriptionWithStats,
 };

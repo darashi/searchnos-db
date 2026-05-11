@@ -155,12 +155,11 @@ pub struct QueryStats {
     pub total_elapsed: Duration,
     pub index_scan_duration: Duration,
     pub post_processing_duration: Duration,
-    pub filters: Vec<FilterPlanStats>,
+    pub filters: Vec<FilterStats>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FilterPlanStats {
-    pub plan: query::QueryPlan,
+pub struct FilterStats {
     pub index_scan_duration: Duration,
     pub post_processing_duration: Duration,
     pub matched_event_count: usize,
