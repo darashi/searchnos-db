@@ -115,6 +115,23 @@ db.load_events_with_progress(reader, |progress: LoadProgress| {
 })?;
 ```
 
+### Streaming initial query results only
+Use `stream_query` when a caller only needs the initial matching events and does not want live updates. It delivers events in the same order as `query` without materializing the full `Vec<String>`.
+
+```rust
+use searchnos_db::SearchnosDB;
+
+let db = SearchnosDB::open("./data")?;
+let filters = r#"[{"kinds":[1],"limit":100}]"#;
+
+db.stream_query(filters, |event_json| {
+    // Process event_json here.
+    true
+})?;
+```
+
+Return `false` from the callback to stop delivery early, for example when the client disconnects or the outbound queue is full. Use `stream_query_with_stats` when the caller also needs query timing details.
+
 Refer to the Rustdoc comments for details on purge policies, index behavior, and the embedded `ndb` format helpers.
 
 ## Development Workflow

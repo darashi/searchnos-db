@@ -83,6 +83,60 @@ impl TestDatabase {
         self.db.query_with_stats(&json).expect("query failed")
     }
 
+    pub(crate) fn stream_query(&self, filters: &[Filter]) -> Vec<String> {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        let mut events = Vec::new();
+        self.db
+            .stream_query(&json, |event| {
+                events.push(event);
+                true
+            })
+            .expect("stream query failed");
+        events
+    }
+
+    pub(crate) fn stream_query_with_stats(&self, filters: &[Filter]) -> QueryResult {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        let mut events = Vec::new();
+        let stats = self
+            .db
+            .stream_query_with_stats(&json, |event| {
+                events.push(event);
+                true
+            })
+            .expect("stream query failed");
+        QueryResult { events, stats }
+    }
+
+    pub(crate) fn stream_query_until(&self, filters: &[Filter], max_events: usize) -> Vec<String> {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        let mut events = Vec::new();
+        self.db
+            .stream_query(&json, |event| {
+                events.push(event);
+                events.len() < max_events
+            })
+            .expect("stream query failed");
+        events
+    }
+
+    pub(crate) fn stream_query_with_stats_until(
+        &self,
+        filters: &[Filter],
+        max_events: usize,
+    ) -> QueryResult {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        let mut events = Vec::new();
+        let stats = self
+            .db
+            .stream_query_with_stats(&json, |event| {
+                events.push(event);
+                events.len() < max_events
+            })
+            .expect("stream query failed");
+        QueryResult { events, stats }
+    }
+
     pub(crate) fn dump_events(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         self.db.dump_events(&mut bytes).expect("dump failed");

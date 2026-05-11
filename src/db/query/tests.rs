@@ -59,6 +59,105 @@ fn query_without_filters_orders_by_created_at_desc() {
 }
 
 #[test]
+fn stream_query_delivers_query_results_in_order() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let oldest = EventBuilder::text_note("oldest")
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&keys)
+        .expect("failed to build oldest event");
+    let newest = EventBuilder::text_note("newest")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build newest event");
+    let middle = EventBuilder::text_note("middle")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build middle event");
+
+    db.insert(&oldest);
+    db.insert(&newest);
+    db.insert(&middle);
+
+    let filters = vec![Filter::new().author(keys.public_key())];
+    let results = db.stream_query(&filters);
+
+    assert_eq!(
+        results,
+        vec![newest.as_json(), middle.as_json(), oldest.as_json()]
+    );
+}
+
+#[test]
+fn stream_query_can_stop_delivery_early() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let first = EventBuilder::text_note("first")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build first event");
+    let second = EventBuilder::text_note("second")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build second event");
+
+    db.insert(&first);
+    db.insert(&second);
+
+    let filters = vec![Filter::new().author(keys.public_key())];
+    let results = db.stream_query_until(&filters, 1);
+
+    assert_eq!(results, vec![first.as_json()]);
+}
+
+#[test]
+fn stream_query_stops_scanning_when_delivery_stops() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let first = EventBuilder::text_note("first")
+        .custom_created_at(Timestamp::from_secs(300))
+        .sign_with_keys(&keys)
+        .expect("failed to build first event");
+    let second = EventBuilder::text_note("second")
+        .custom_created_at(Timestamp::from_secs(200))
+        .sign_with_keys(&keys)
+        .expect("failed to build second event");
+
+    db.insert(&first);
+    db.insert(&second);
+
+    let filters = vec![Filter::new().author(keys.public_key())];
+    let result = db.stream_query_with_stats_until(&filters, 1);
+
+    assert_eq!(result.events, vec![first.as_json()]);
+    assert_eq!(result.stats.filters[0].candidate_count, 1);
+    assert_eq!(result.stats.filters[0].matched_event_count, 1);
+}
+
+#[test]
+fn stream_query_with_stats_reports_filter_details() {
+    let db = TestDatabase::new();
+    let keys = Keys::generate();
+
+    let event = EventBuilder::text_note("stats timing")
+        .sign_with_keys(&keys)
+        .expect("failed to build event");
+    db.insert(&event);
+
+    let filters = vec![Filter::new().author(keys.public_key())];
+    let result = db.stream_query_with_stats(&filters);
+
+    assert_eq!(result.events, vec![event.as_json()]);
+    assert_eq!(result.stats.filters.len(), 1);
+    assert!(result.stats.total_elapsed >= result.stats.index_scan_duration);
+    assert!(result.stats.total_elapsed >= result.stats.post_processing_duration);
+    assert!(result.stats.filters[0].candidate_count >= result.stats.filters[0].matched_event_count);
+}
+
+#[test]
 fn query_deduplicates_results_from_multiple_filters() {
     let db = TestDatabase::new();
     let keys = Keys::generate();

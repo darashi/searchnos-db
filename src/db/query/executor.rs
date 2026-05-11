@@ -22,6 +22,22 @@ struct FilterCollectionResult {
     candidate_count: usize,
 }
 
+struct QueryKeyResult<'env> {
+    txn: RoTransaction<'env>,
+    keys: Vec<[u8; SEQ_BYTES]>,
+    total_start: Instant,
+    index_scan_duration: Duration,
+    post_processing_duration: Duration,
+    filter_stats: Vec<FilterStats>,
+}
+
+struct StreamingFilterStats {
+    index_scan_duration: Duration,
+    matched_event_count: usize,
+    candidate_count: usize,
+    completed: bool,
+}
+
 impl SearchnosDB {
     pub(crate) fn to_ndb_filter(filter: &Filter, include_search: bool) -> NdbFilter {
         let ids = filter
@@ -73,6 +89,117 @@ impl SearchnosDB {
 
     /// Execute the provided filters and return matching events alongside timing details.
     pub fn query_with_stats(&self, filters_json: &str) -> Result<QueryResult, SearchnosDBError> {
+        let QueryKeyResult {
+            txn,
+            keys,
+            total_start,
+            index_scan_duration,
+            post_processing_duration,
+            filter_stats,
+        } = self.query_keys(filters_json)?;
+        let events = self.event_keys_to_json(&txn, &keys)?;
+        let stats = Self::finish_query_stats(
+            total_start,
+            index_scan_duration,
+            post_processing_duration,
+            filter_stats,
+        );
+
+        Ok(QueryResult { events, stats })
+    }
+
+    /// Execute the provided filters and pass each matching event to `on_event`.
+    ///
+    /// Events are delivered in the same order as `query_with_stats`. Returning
+    /// `false` from `on_event` stops event delivery early, but the returned
+    /// stats still describe the completed index scan.
+    pub fn stream_query_with_stats<F>(
+        &self,
+        filters_json: &str,
+        mut on_event: F,
+    ) -> Result<QueryStats, SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        if let Some(stats) = self.try_stream_query_incrementally(filters_json, &mut on_event)? {
+            return Ok(stats);
+        }
+
+        let QueryKeyResult {
+            txn,
+            keys,
+            total_start,
+            index_scan_duration,
+            post_processing_duration,
+            filter_stats,
+        } = self.query_keys(filters_json)?;
+        self.stream_event_keys_as_json(&txn, &keys, on_event)?;
+        let stats = Self::finish_query_stats(
+            total_start,
+            index_scan_duration,
+            post_processing_duration,
+            filter_stats,
+        );
+        Ok(stats)
+    }
+
+    fn try_stream_query_incrementally<F>(
+        &self,
+        filters_json: &str,
+        on_event: &mut F,
+    ) -> Result<Option<QueryStats>, SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        let total_start = Instant::now();
+        let filters = Self::parse_filters_json(filters_json)?;
+        let normalized_filters = self.normalized_filters_or_default(&filters);
+
+        if normalized_filters.len() != 1 {
+            return Ok(None);
+        }
+
+        let txn = self.begin_ro_txn()?;
+        let stream_stats =
+            self.stream_filter_events_as_json(&txn, &normalized_filters[0], on_event)?;
+
+        let filter_stats = vec![FilterStats {
+            index_scan_duration: stream_stats.index_scan_duration,
+            post_processing_duration: Duration::default(),
+            matched_event_count: stream_stats.matched_event_count,
+            candidate_count: stream_stats.candidate_count,
+        }];
+        let total_elapsed = total_start.elapsed();
+        let stats = QueryStats {
+            total_elapsed,
+            index_scan_duration: stream_stats.index_scan_duration,
+            post_processing_duration: if stream_stats.completed {
+                total_elapsed.saturating_sub(stream_stats.index_scan_duration)
+            } else {
+                Duration::default()
+            },
+            filters: filter_stats,
+        };
+
+        Ok(Some(stats))
+    }
+
+    /// Execute the provided filters and stream matching events without timing stats.
+    pub fn stream_query<F>(&self, filters_json: &str, on_event: F) -> Result<(), SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        self.stream_query_with_stats(filters_json, on_event)
+            .map(|_| ())
+    }
+
+    /// Backwards-compatible query helper that drops timing stats.
+    pub fn query(&self, filters_json: &str) -> Result<Vec<String>, SearchnosDBError> {
+        self.query_with_stats(filters_json)
+            .map(|result| result.events)
+    }
+
+    fn query_keys(&self, filters_json: &str) -> Result<QueryKeyResult<'_>, SearchnosDBError> {
         let total_start = Instant::now();
         let filters = Self::parse_filters_json(filters_json)?;
         let txn = self.begin_ro_txn()?;
@@ -97,23 +224,30 @@ impl SearchnosDB {
         });
 
         let keys: Vec<[u8; SEQ_BYTES]> = entries.into_iter().map(|(_, seq)| seq).collect();
-        let events = self.event_keys_to_json(&txn, &keys)?;
         post_processing_duration += final_processing_start.elapsed();
 
-        let stats = QueryStats {
+        Ok(QueryKeyResult {
+            txn,
+            keys,
+            total_start,
+            index_scan_duration,
+            post_processing_duration,
+            filter_stats,
+        })
+    }
+
+    fn finish_query_stats(
+        total_start: Instant,
+        index_scan_duration: Duration,
+        post_processing_duration: Duration,
+        filter_stats: Vec<FilterStats>,
+    ) -> QueryStats {
+        QueryStats {
             total_elapsed: total_start.elapsed(),
             index_scan_duration,
             post_processing_duration,
             filters: filter_stats,
-        };
-
-        Ok(QueryResult { events, stats })
-    }
-
-    /// Backwards-compatible query helper that drops timing stats.
-    pub fn query(&self, filters_json: &str) -> Result<Vec<String>, SearchnosDBError> {
-        self.query_with_stats(filters_json)
-            .map(|result| result.events)
+        }
     }
 
     fn append_keys_for_filter<'env>(
@@ -246,6 +380,114 @@ impl SearchnosDB {
         })
     }
 
+    fn stream_filter_events_as_json<'env, F>(
+        &self,
+        txn: &'env RoTransaction<'env>,
+        filter: &Filter,
+        mut on_event: F,
+    ) -> Result<StreamingFilterStats, SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        let index_start = Instant::now();
+
+        if matches!(filter.limit, Some(0)) {
+            return Ok(StreamingFilterStats {
+                index_scan_duration: index_start.elapsed(),
+                matched_event_count: 0,
+                candidate_count: 0,
+                completed: true,
+            });
+        }
+
+        let search_terms = filter
+            .search
+            .as_ref()
+            .map(|search| normalize_query_terms(search));
+
+        if search_terms.as_ref().is_some_and(|terms| terms.is_empty()) {
+            return Ok(StreamingFilterStats {
+                index_scan_duration: index_start.elapsed(),
+                matched_event_count: 0,
+                candidate_count: 0,
+                completed: true,
+            });
+        }
+
+        let match_opts = MatchEventOptions::new().nip50(search_terms.is_some());
+        let ndb_filter = Self::to_ndb_filter(filter, match_opts.nip50);
+        let since = filter.since.map(|ts| ts.as_u64());
+        let until = filter.until.map(|ts| ts.as_u64());
+        let limit = filter.limit.filter(|&limit| limit > 0);
+        let mut cursor = txn.open_ro_cursor(self.contents.database())?;
+        let mut positioned = ContentsStore::position_cursor(&mut cursor, until)?;
+        let mut matched_event_count = 0usize;
+        let mut candidate_count = 0usize;
+        let mut completed = true;
+
+        while positioned {
+            let (contents_key, content_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
+                Ok((Some(key), value)) => (key, value),
+                Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
+                Err(err) => return Err(err.into()),
+            };
+
+            let (created_at, seq_bytes) = ContentsStore::split_key(contents_key)?;
+
+            if let Some(since) = since
+                && created_at < since
+            {
+                break;
+            }
+
+            if let Some(until) = until
+                && created_at > until
+            {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+                continue;
+            }
+
+            candidate_count = candidate_count.saturating_add(1);
+            let event_bytes = txn.get(self.events, &seq_bytes)?;
+            let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+
+            if !note_matches_filter(&note, &ndb_filter, match_opts, content_bytes) {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+                continue;
+            }
+
+            if let Some(expiration) = extract_note_expiration(&note)
+                && !Self::note_is_ephemeral(&note)
+                && Self::is_expired(expiration)
+            {
+                positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+                continue;
+            }
+
+            matched_event_count = matched_event_count.saturating_add(1);
+            let event_json = from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+            if !on_event(event_json) {
+                completed = false;
+                break;
+            }
+
+            if let Some(limit) = limit
+                && matched_event_count >= limit
+            {
+                break;
+            }
+
+            positioned = Self::move_contents_cursor_prev(&mut cursor)?;
+        }
+
+        Ok(StreamingFilterStats {
+            index_scan_duration: index_start.elapsed(),
+            matched_event_count,
+            candidate_count,
+            completed,
+        })
+    }
+
     fn move_contents_cursor_prev(cursor: &mut RoCursor<'_>) -> Result<bool, SearchnosDBError> {
         match cursor.get(None, None, MDB_PREV) {
             Ok(_) => Ok(true),
@@ -277,5 +519,25 @@ impl SearchnosDB {
         }
 
         Ok(events)
+    }
+
+    fn stream_event_keys_as_json<'env, F>(
+        &self,
+        txn: &'env RoTransaction<'env>,
+        keys: &[[u8; SEQ_BYTES]],
+        mut on_event: F,
+    ) -> Result<(), SearchnosDBError>
+    where
+        F: FnMut(String) -> bool,
+    {
+        for key in keys {
+            let event_bytes = txn.get(self.events, key)?;
+            let event_json = from_ndb_note(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+            if !on_event(event_json) {
+                break;
+            }
+        }
+
+        Ok(())
     }
 }
