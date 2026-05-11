@@ -226,19 +226,16 @@ pub(crate) fn note_matches_filter(
         && let Some(query) = filter.search.as_ref()
     {
         let terms: Vec<&str> = query.split_whitespace().collect();
-        if !terms.is_empty()
-            && !terms.iter().all(|term| {
-                let needle = term.as_bytes();
-                content
-                    .windows(needle.len())
-                    .any(|window| window.eq_ignore_ascii_case(needle))
-            })
-        {
+        if !terms.is_empty() && !terms.iter().all(|term| contains_search_term(content, term)) {
             return false;
         }
     }
 
     true
+}
+
+fn contains_search_term(content: &[u8], term: &str) -> bool {
+    memchr::memmem::find(content, term.as_bytes()).is_some()
 }
 
 fn matches_generic_tags(note: &NdbNote<'_>, filter: &NdbFilter) -> bool {

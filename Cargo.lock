@@ -650,6 +650,7 @@ dependencies = [
  "indicatif",
  "lmdb",
  "lmdb-sys",
+ "memchr",
  "ndb-note-rs",
  "rayon",
  "secp256k1",
