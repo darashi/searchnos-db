@@ -134,11 +134,6 @@ impl TestDatabase {
             .get(self.db.event_id_index.database(), &index_key)
             .expect("event id index missing");
         assert_eq!(index_seq, seq_bytes);
-
-        assert!(
-            self.kind_contains(txn, event.kind.as_u16(), event.created_at.as_u64(), seq),
-            "kind index missing seq {seq}"
-        );
     }
 
     pub(crate) fn assert_event_removed(&self, txn: &RoTransaction<'_>, seq: u64, event: &Event) {
@@ -158,10 +153,6 @@ impl TestDatabase {
             txn.get(self.db.event_id_index.database(), &index_key),
             Err(lmdb::Error::NotFound)
         ));
-        assert!(
-            !self.kind_contains(txn, event.kind.as_u16(), event.created_at.as_u64(), seq),
-            "kind index retained seq {seq}"
-        );
     }
 
     pub(crate) fn assert_deletion_marker_eq(
@@ -201,20 +192,6 @@ impl TestDatabase {
             txn.get(self.db.event_id_index.database(), &index_key),
             Err(lmdb::Error::NotFound)
         ));
-    }
-
-    pub(crate) fn kind_contains(
-        &self,
-        txn: &RoTransaction<'_>,
-        kind: u16,
-        _created_at: u64,
-        seq: u64,
-    ) -> bool {
-        self.db
-            .kind_index
-            .iter_candidates(txn, &[kind], None, None)
-            .expect("kind iterator failed")
-            .any(|candidate| candidate == seq.to_ne_bytes())
     }
 
     pub(crate) fn event_index_key(event_id: &EventId, created_at: u64) -> Vec<u8> {

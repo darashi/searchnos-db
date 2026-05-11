@@ -1,15 +1,7 @@
-use super::{
-    PurgePolicy, SearchnosDB, SearchnosDBError,
-    index::{
-        KindsIndex,
-        common::{position_cursor_at_prefix_end, seq_from_value, split_created_at_from_key},
-    },
-};
+use super::{PurgePolicy, SearchnosDB, SearchnosDBError, index::ContentsStore};
 use lmdb::{Cursor, RwTransaction, Transaction};
-use lmdb_sys::{MDB_FIRST, MDB_GET_CURRENT, MDB_LAST_DUP, MDB_NEXT_NODUP, MDB_PREV, MDB_SET_RANGE};
+use ndb::NdbNote;
 use std::{
-    cmp::Ordering,
-    collections::HashSet,
     sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -145,30 +137,15 @@ impl SearchnosDB {
             return Ok(removed);
         }
 
-        let mut candidates: Vec<(u64, u64)> = Vec::new();
-        let mut seen = HashSet::new();
-
-        self.append_candidates_by_kind(
+        let mut candidates = Vec::new();
+        self.append_candidates_from_contents(
             &mut txn,
             policy,
             now,
             remaining,
             deadline,
             &mut candidates,
-            &mut seen,
         )?;
-
-        if candidates.len() < remaining && !Self::deadline_reached(deadline) {
-            self.append_candidates_by_default(
-                &mut txn,
-                policy,
-                now,
-                remaining,
-                deadline,
-                &mut candidates,
-                &mut seen,
-            )?;
-        }
 
         if candidates.is_empty() {
             if removed > 0 {
@@ -176,11 +153,6 @@ impl SearchnosDB {
             }
             return Ok(removed);
         }
-
-        candidates.sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
-            Ordering::Equal => a.1.cmp(&b.1),
-            other => other,
-        });
 
         for (_created_at, seq) in candidates.into_iter().take(remaining) {
             if Self::deadline_reached(deadline) {
@@ -202,7 +174,7 @@ impl SearchnosDB {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn append_candidates_by_kind(
+    fn append_candidates_from_contents(
         &self,
         txn: &mut RwTransaction<'_>,
         policy: &PurgePolicy,
@@ -210,220 +182,55 @@ impl SearchnosDB {
         max_events: usize,
         deadline: Option<Instant>,
         out: &mut Vec<(u64, u64)>,
-        seen: &mut HashSet<u64>,
     ) -> Result<(), SearchnosDBError> {
-        self.append_candidates_for_kinds(
-            txn,
-            policy.purge_overrides(),
-            now,
-            max_events,
-            deadline,
-            out,
-            seen,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_candidates_by_default(
-        &self,
-        txn: &mut RwTransaction<'_>,
-        policy: &PurgePolicy,
-        now: u64,
-        max_events: usize,
-        deadline: Option<Instant>,
-        out: &mut Vec<(u64, u64)>,
-        seen: &mut HashSet<u64>,
-    ) -> Result<(), SearchnosDBError> {
-        let Some(default_purge_after) = policy.default_duration() else {
-            return Ok(());
-        };
-
         if out.len() >= max_events || Self::deadline_reached(deadline) {
             return Ok(());
         }
 
-        let mut kinds = Vec::new();
-        {
-            let cursor = txn.open_ro_cursor(self.kind_index.database())?;
-            let mut result = cursor.get(None, None, MDB_FIRST);
-            loop {
-                if Self::deadline_reached(deadline) {
-                    break;
-                }
-                match result {
-                    Ok((Some(kind_bytes), _)) => {
-                        if kind_bytes.len() < 2 {
-                            result = cursor.get(None, None, MDB_NEXT_NODUP);
-                            continue;
-                        }
-                        let mut buffer = [0u8; 2];
-                        buffer.copy_from_slice(&kind_bytes[..2]);
-                        let kind = u16::from_be_bytes(buffer);
-                        if policy.has_override(kind) {
-                            result = cursor.get(None, None, MDB_NEXT_NODUP);
-                            continue;
-                        }
-                        kinds.push(kind);
-                        result = cursor.get(None, None, MDB_NEXT_NODUP);
-                    }
-                    Ok(_) | Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        }
-
-        self.append_candidates_for_kinds(
-            txn,
-            kinds.into_iter().map(|kind| (kind, default_purge_after)),
-            now,
-            max_events,
-            deadline,
-            out,
-            seen,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_candidates_for_kinds<I>(
-        &self,
-        txn: &mut RwTransaction<'_>,
-        kinds: I,
-        now: u64,
-        max_events: usize,
-        deadline: Option<Instant>,
-        out: &mut Vec<(u64, u64)>,
-        seen: &mut HashSet<u64>,
-    ) -> Result<(), SearchnosDBError>
-    where
-        I: IntoIterator<Item = (u16, Duration)>,
-    {
-        if max_events == 0 || out.len() >= max_events || Self::deadline_reached(deadline) {
+        let Some(max_cutoff) = Self::max_policy_cutoff(policy, now) else {
             return Ok(());
-        }
+        };
 
-        for (kind, purge_after) in kinds.into_iter() {
-            if out.len() >= max_events || Self::deadline_reached(deadline) {
+        let mut cursor = txn.open_ro_cursor(self.contents.database())?;
+        for (content_key, _) in cursor.iter() {
+            if Self::deadline_reached(deadline) || out.len() >= max_events {
                 break;
             }
-            self.append_candidates_for_kind(
-                txn,
-                kind,
-                purge_after,
-                now,
-                max_events,
-                deadline,
-                out,
-                seen,
-            )?;
-        }
 
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_candidates_for_kind(
-        &self,
-        txn: &mut RwTransaction<'_>,
-        kind: u16,
-        purge_after: Duration,
-        now: u64,
-        max_events: usize,
-        deadline: Option<Instant>,
-        out: &mut Vec<(u64, u64)>,
-        seen: &mut HashSet<u64>,
-    ) -> Result<(), SearchnosDBError> {
-        if out.len() >= max_events || Self::deadline_reached(deadline) {
-            return Ok(());
-        }
-
-        let retention_secs = purge_after.as_secs();
-        let cutoff = now.saturating_sub(retention_secs);
-        let mut cursor = txn.open_ro_cursor(self.kind_index.database())?;
-        let prefix = KindsIndex::kind_key(kind);
-        if self.position_cursor_at_kind_cutoff(&mut cursor, &prefix, cutoff)? {
-            loop {
-                if Self::deadline_reached(deadline) {
-                    break;
-                }
-                let (key_bytes, value_bytes) = match cursor.get(None, None, MDB_GET_CURRENT) {
-                    Ok((Some(key), value)) => (key, value),
-                    Ok((None, _)) | Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                };
-
-                if !key_bytes.starts_with(&prefix) {
-                    break;
-                }
-
-                let created_at = split_created_at_from_key(key_bytes)?;
-                let seq_bytes = seq_from_value(value_bytes)?;
-                let seq = u64::from_ne_bytes(seq_bytes);
-                if seen.insert(seq) {
-                    out.push((created_at, seq));
-                }
-                if out.len() >= max_events {
-                    break;
-                }
-
-                match cursor.get(None, None, MDB_PREV) {
-                    Ok(_) => continue,
-                    Err(lmdb::Error::NotFound) => break,
-                    Err(err) => return Err(err.into()),
-                }
+            let (created_at, seq_bytes) = ContentsStore::split_key(content_key)?;
+            if created_at > max_cutoff {
+                break;
             }
-        }
 
-        Ok(())
-    }
-
-    fn position_cursor_at_kind_cutoff(
-        &self,
-        cursor: &mut lmdb::RoCursor<'_>,
-        prefix: &[u8],
-        cutoff: u64,
-    ) -> Result<bool, SearchnosDBError> {
-        let mut seek_key = Vec::with_capacity(prefix.len() + std::mem::size_of::<u64>());
-        seek_key.extend_from_slice(prefix);
-        seek_key.extend_from_slice(&cutoff.to_be_bytes());
-
-        match cursor.get(Some(&seek_key), None, MDB_SET_RANGE) {
-            Ok((Some(_), _)) => {}
-            Ok((None, _)) | Err(lmdb::Error::NotFound) => {
-                if !position_cursor_at_prefix_end(cursor, prefix)? {
-                    return Ok(false);
-                }
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        loop {
-            let (key_bytes, _) = match cursor.get(None, None, MDB_GET_CURRENT) {
-                Ok((Some(key), value)) => (key, value),
-                Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(false),
+            let event_bytes = match txn.get(self.events, &seq_bytes) {
+                Ok(bytes) => bytes,
+                Err(lmdb::Error::NotFound) => continue,
                 Err(err) => return Err(err.into()),
             };
-
-            if key_bytes.starts_with(prefix) {
-                let created_at = split_created_at_from_key(key_bytes)?;
-                if created_at <= cutoff {
-                    return match cursor.get(None, None, MDB_LAST_DUP) {
-                        Ok(_) => Ok(true),
-                        Err(lmdb::Error::NotFound) => Ok(false),
-                        Err(err) => Err(err.into()),
-                    };
-                }
-            }
-
-            match cursor.get(None, None, MDB_PREV) {
-                Ok((Some(prev_key), _)) => {
-                    if !prev_key.starts_with(prefix) {
-                        return Ok(false);
-                    }
-                }
-                Ok((None, _)) | Err(lmdb::Error::NotFound) => return Ok(false),
-                Err(err) => return Err(err.into()),
+            let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+            let kind = match u16::try_from(note.kind()) {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+            let Some(retention) = policy.purge_after_for_kind(kind) else {
+                continue;
+            };
+            let cutoff = now.saturating_sub(retention.as_secs());
+            if created_at <= cutoff {
+                out.push((created_at, u64::from_ne_bytes(seq_bytes)));
             }
         }
+
+        Ok(())
+    }
+
+    fn max_policy_cutoff(policy: &PurgePolicy, now: u64) -> Option<u64> {
+        policy
+            .default_duration()
+            .into_iter()
+            .chain(policy.purge_overrides().map(|(_, duration)| duration))
+            .map(|duration| now.saturating_sub(duration.as_secs()))
+            .max()
     }
 }
 

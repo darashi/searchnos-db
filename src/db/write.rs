@@ -132,7 +132,7 @@ impl SearchnosDB {
             return Ok(InsertResult::Dropped);
         }
 
-        let seq = self.perform_event_insertion(txn, &prepared.event, &prepared)?;
+        let seq = self.perform_event_insertion(txn, &prepared)?;
 
         if let Some(plan) = &replacement_plan {
             self.replacables.put(txn, &plan.slot_key, seq)?;
@@ -249,12 +249,11 @@ impl SearchnosDB {
     fn perform_event_insertion<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
-        event: &Event,
         prepared: &PreparedInsert,
     ) -> Result<u64, SearchnosDBError> {
         let seq = self.next_seq(txn)?;
         self.insert_event_data(txn, seq, &prepared.note_bytes, &prepared.index_data)?;
-        self.update_indexes(txn, seq, event, &prepared.index_data, prepared.expiration)?;
+        self.update_indexes(txn, seq, &prepared.index_data, prepared.expiration)?;
         Ok(seq)
     }
 
@@ -283,14 +282,9 @@ impl SearchnosDB {
         &self,
         txn: &mut RwTransaction<'env>,
         seq: u64,
-        event: &Event,
         index_data: &EventIndexData,
         expiration: Option<u64>,
     ) -> Result<(), SearchnosDBError> {
-        let created_at = index_data.created_at;
-
-        self.kind_index
-            .put(txn, event.kind.as_u16(), created_at, seq)?;
         self.event_id_index
             .put(txn, &index_data.event_index_key, seq)?;
 
@@ -482,8 +476,6 @@ impl SearchnosDB {
         self.event_id_index.delete(txn, &event_index_key)?;
 
         let created_at = event.created_at.as_u64();
-        self.kind_index
-            .delete_value(txn, event.kind.as_u16(), created_at, seq)?;
 
         if let Some(replacable_key) = Self::replacable_key(&event) {
             self.replacables.delete_entry(txn, &replacable_key, seq)?;

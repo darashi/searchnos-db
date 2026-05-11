@@ -2,9 +2,7 @@ use lmdb::{Cursor, Database, RoTransaction, Transaction};
 
 use super::{
     DatabaseStats, EVENTS_DB_NAME, SearchnosDB, SearchnosDBError,
-    index::{
-        ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex, ReplacableIndex,
-    },
+    index::{ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, ReplacableIndex},
 };
 
 impl SearchnosDB {
@@ -14,7 +12,6 @@ impl SearchnosDB {
         Ok(vec![
             self.get_stats_for_db(&txn, self.events, EVENTS_DB_NAME)?,
             self.get_stats_for_db(&txn, self.event_id_index.database(), EventIdIndex::NAME)?,
-            self.get_stats_for_db(&txn, self.kind_index.database(), KindsIndex::NAME)?,
             self.get_stats_for_db(&txn, self.deletions.database(), DeletionIndex::NAME)?,
             self.get_stats_for_db(&txn, self.replacables.database(), ReplacableIndex::NAME)?,
             self.get_stats_for_db(&txn, self.contents.database(), ContentsStore::NAME)?,

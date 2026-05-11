@@ -6,8 +6,8 @@ use crate::ndb_ext::from_ndb_note;
 use crate::nostr::{EventError, Filter};
 use serde_json::{Map, Value};
 use std::io::{ErrorKind, Read, Write};
-use std::{collections::BTreeMap, path::Path, sync::Mutex, time::Duration};
 use std::{mem, sync::Arc};
+use std::{path::Path, sync::Mutex, time::Duration};
 
 use tokio::task::JoinError;
 
@@ -60,16 +60,13 @@ const CREATED_AT_BYTES: usize = std::mem::size_of::<u64>();
 const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
 const DUMP_LENGTH_PREFIX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
-use index::{
-    ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, KindsIndex, ReplacableIndex,
-};
+use index::{ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, ReplacableIndex};
 
 #[derive(Debug)]
 pub struct SearchnosDB {
     env: Environment,
     events: Database,
     event_id_index: EventIdIndex,
-    kind_index: KindsIndex,
     deletions: DeletionIndex,
     replacables: ReplacableIndex,
     contents: ContentsStore,
@@ -79,14 +76,6 @@ pub struct SearchnosDB {
     subscriptions: subscription::SubscriptionManager,
     default_limit: Option<usize>,
     max_limit: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct KindStats {
-    pub kind: u16,
-    pub count: usize,
-    pub oldest_created_at: Option<u64>,
-    pub newest_created_at: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -198,7 +187,6 @@ impl SearchnosDB {
 
         let events = env.create_db(Some(EVENTS_DB_NAME), DatabaseFlags::INTEGER_KEY)?;
         let event_id_index = EventIdIndex::open(&env)?;
-        let kind_index = KindsIndex::open(&env)?;
         let deletions = DeletionIndex::open(&env)?;
         let replacables = ReplacableIndex::open(&env)?;
         let contents = ContentsStore::open(&env)?;
@@ -211,7 +199,6 @@ impl SearchnosDB {
             env,
             events,
             event_id_index,
-            kind_index,
             deletions,
             replacables,
             contents,
@@ -371,38 +358,6 @@ impl SearchnosDB {
         } else {
             self.normalized_filters(filters)
         }
-    }
-
-    /// Summarize stored events grouped by their kind.
-    pub fn kind_stats(&self) -> Result<Vec<KindStats>, SearchnosDBError> {
-        let txn = self.begin_ro_txn()?;
-        let mut cursor = txn.open_ro_cursor(self.kind_index.database())?;
-        let mut stats = BTreeMap::new();
-
-        for (key, _) in cursor.iter() {
-            if key.len() < std::mem::size_of::<u16>() {
-                return Err(SearchnosDBError::InvalidKeyLength(key.len()));
-            }
-            let kind = KindsIndex::decode_key(&key[..std::mem::size_of::<u16>()])?;
-            let created_at = index::common::split_created_at_from_key(key)?;
-            let entry = stats.entry(kind).or_insert(KindStats {
-                kind,
-                count: 0,
-                oldest_created_at: None,
-                newest_created_at: None,
-            });
-            entry.count += 1;
-            entry.oldest_created_at = Some(match entry.oldest_created_at {
-                Some(oldest) => oldest.min(created_at),
-                None => created_at,
-            });
-            entry.newest_created_at = Some(match entry.newest_created_at {
-                Some(newest) => newest.max(created_at),
-                None => created_at,
-            });
-        }
-
-        Ok(stats.into_values().collect())
     }
 
     /// Write stored ndb notes as repeated `(u32 length, payload)` records.

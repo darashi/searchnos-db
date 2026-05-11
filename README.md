@@ -8,7 +8,7 @@ Text search is evaluated by scanning normalized event content.
 
 ## Highlights
 - **LMDB storage**: relies on a durable B+Tree datastore optimized for random access workloads.
-- **Focused indexing**: maintains indexes for event IDs, kinds, expiration timestamps, deletion markers, and replaceable-event slots.
+- **Focused indexing**: maintains indexes for event IDs, expiration timestamps, deletion markers, and replaceable-event slots.
 - **Text normalization**: normalizes Unicode text (NFKC), lowercases, and collapses whitespace to improve search quality.
 - **Expiration handling**: reads `expiration` tags and optional purge policies to drop stale events.
 - **Operational tooling**: ships with CLI subcommands for statistics, imports, dumps, and queries.
