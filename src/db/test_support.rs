@@ -3,8 +3,8 @@ use std::convert::TryInto;
 use crate::text::{extract_text, normalize_text};
 
 use super::{
-    DumpProgress, LoadProgress, QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBOptions,
-    Subscription, index::ContentsStore, write::InsertResult,
+    DumpProgress, LoadProgress, QueryResult, SEQ_BYTES, SearchnosDB, SearchnosDBError,
+    SearchnosDBOptions, Subscription, index::ContentsStore, write::InsertResult,
 };
 
 use crate::ndb_ext::from_ndb_note;
@@ -58,6 +58,13 @@ impl TestDatabase {
             InsertResult::Inserted(seq) | InsertResult::AlreadyExists(seq) => Some(seq),
             InsertResult::Dropped => None,
         }
+    }
+
+    pub(crate) fn insert_error(&self, event: &Event) -> SearchnosDBError {
+        let mut txn = self.db.begin_rw_txn().expect("failed to begin transaction");
+        self.db
+            .insert(&mut txn, &event.as_json())
+            .expect_err("insert unexpectedly succeeded")
     }
 
     pub(crate) fn purge_with_time(&self, limit: usize, now: u64) -> usize {

@@ -1,4 +1,5 @@
 use ndb::{NdbNote, NdbNoteBuf, TagElement};
+use sha2::{Digest, Sha256};
 
 use crate::nostr::Kind;
 
@@ -175,6 +176,64 @@ pub(crate) fn note_deletion_ids(note: &NdbNote<'_>) -> Vec<[u8; 32]> {
     }
 
     ids
+}
+
+pub(crate) fn parse_a_tag(value: &str) -> Option<(u32, [u8; 32], &str)> {
+    let mut parts = value.splitn(3, ':');
+    let kind = parts.next()?.parse::<u32>().ok()?;
+    let pubkey_hex = parts.next()?;
+    let d_tag = parts.next()?;
+    if pubkey_hex.len() != 64 {
+        return None;
+    }
+
+    let mut pubkey = [0u8; 32];
+    hex::decode_to_slice(pubkey_hex, &mut pubkey).ok()?;
+    Some((kind, pubkey, d_tag))
+}
+
+pub(crate) fn replace_deletion_hash(a_tag: &str) -> [u8; 32] {
+    Sha256::digest(a_tag.as_bytes()).into()
+}
+
+pub(crate) fn replace_deletion_hash_from_parts(
+    kind: u32,
+    pubkey: &[u8; 32],
+    d_tag: &str,
+) -> [u8; 32] {
+    replace_deletion_hash(&format!("{}:{}:{}", kind, hex::encode(pubkey), d_tag))
+}
+
+pub(crate) fn note_replace_deletion_hashes(note: &NdbNote<'_>) -> Vec<[u8; 32]> {
+    if note.kind() != Kind::EventDeletion.as_u32() {
+        return Vec::new();
+    }
+
+    let mut hashes = Vec::new();
+    for tag in note.tags() {
+        let Ok(tag) = tag else {
+            continue;
+        };
+        let mut elements = tag.elements();
+        let Some(Ok(identifier)) = elements.next() else {
+            continue;
+        };
+        if tag_text(identifier) != Some("a") {
+            continue;
+        }
+
+        let Some(Ok(TagElement::Text(a_tag))) = elements.next() else {
+            continue;
+        };
+        let Some((kind, pubkey, d_tag)) = parse_a_tag(a_tag) else {
+            continue;
+        };
+        if (30_000..40_000).contains(&kind) && pubkey == *note.pubkey() {
+            hashes.push(replace_deletion_hash_from_parts(kind, &pubkey, d_tag));
+        }
+    }
+
+    hashes
 }
 
 pub(crate) fn note_matches_filter(

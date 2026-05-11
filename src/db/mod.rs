@@ -60,7 +60,10 @@ const CREATED_AT_BYTES: usize = std::mem::size_of::<u64>();
 const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
 const DUMP_LENGTH_PREFIX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 
-use index::{ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, ReplacableIndex};
+use index::{
+    ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, ReplacableIndex,
+    ReplaceDeletionIndex,
+};
 
 #[derive(Debug)]
 pub struct SearchnosDB {
@@ -69,6 +72,7 @@ pub struct SearchnosDB {
     event_id_index: EventIdIndex,
     deletions: DeletionIndex,
     replacables: ReplacableIndex,
+    replace_deletions: ReplaceDeletionIndex,
     contents: ContentsStore,
     expiration_index: ExpirationIndex,
     batch: Mutex<BatchState>,
@@ -96,6 +100,8 @@ pub enum SearchnosDBError {
     ParseFilters(#[from] serde_json::Error),
     #[error("invalid tag query '{tag}': tag identifier must be a single character")]
     InvalidTagQuery { tag: String },
+    #[error("invalid deletion a-tag: {0}")]
+    InvalidDeletionATag(String),
     #[error("unexpected key length: expected {KEY_BYTES} bytes, got {0}")]
     InvalidKeyLength(usize),
     #[error("u64 key space exhausted")]
@@ -181,7 +187,7 @@ impl SearchnosDB {
         std::fs::create_dir_all(path_ref)?;
 
         let env = Environment::new()
-            .set_max_dbs(13)
+            .set_max_dbs(14)
             .set_map_size(DEFAULT_MAP_SIZE)
             .open(path_ref)?;
 
@@ -189,6 +195,7 @@ impl SearchnosDB {
         let event_id_index = EventIdIndex::open(&env)?;
         let deletions = DeletionIndex::open(&env)?;
         let replacables = ReplacableIndex::open(&env)?;
+        let replace_deletions = ReplaceDeletionIndex::open(&env)?;
         let contents = ContentsStore::open(&env)?;
         let expiration_index = ExpirationIndex::open(&env)?;
         let batch = Mutex::new(BatchState::new(options.batch_size, options.flush_interval));
@@ -201,6 +208,7 @@ impl SearchnosDB {
             event_id_index,
             deletions,
             replacables,
+            replace_deletions,
             contents,
             expiration_index,
             batch,
@@ -527,7 +535,7 @@ mod tests {
         test_support::TestDatabase,
     };
     use crate::nostr::{
-        Event, EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, Timestamp,
+        Event, EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, PublicKey, Timestamp,
         test_utils::{EventBuilder, Keys},
     };
 
@@ -1074,6 +1082,133 @@ mod tests {
     }
 
     #[test]
+    fn deletion_by_a_tag_removes_addressable_event_and_blocks_late_insert() {
+        let db = TestDatabase::new();
+        let keys = Keys::generate();
+
+        let original = TestDatabase::build_addressable_event(&keys, "slot", 5_000, "original");
+        let original_seq = db.insert(&original);
+        assert_eq!(original_seq, 0);
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "delete addressable")
+            .tag(addressable_tag(
+                Kind::LongFormTextNote,
+                keys.public_key(),
+                "slot",
+            ))
+            .custom_created_at(Timestamp::from_secs(6_000))
+            .sign_with_keys(&keys)
+            .expect("failed to build a-tag deletion");
+        let deletion_seq = db.insert(&deletion);
+        assert_eq!(deletion_seq, 1);
+
+        let late = TestDatabase::build_addressable_event(&keys, "slot", 5_500, "late");
+        assert_eq!(db.insert(&late), deletion_seq);
+
+        let newer = TestDatabase::build_addressable_event(&keys, "slot", 6_500, "newer");
+        let newer_seq = db.insert(&newer);
+        assert_eq!(newer_seq, 2);
+
+        let txn = db.ro_txn();
+        db.assert_event_removed(&txn, original_seq, &original);
+        db.assert_event_absent(&txn, &late);
+        db.assert_event_stored(&txn, deletion_seq, &deletion);
+        db.assert_event_stored(&txn, newer_seq, &newer);
+    }
+
+    #[test]
+    fn deletion_by_noncanonical_a_tag_blocks_late_addressable_insert() {
+        let db = TestDatabase::new();
+        let keys = Keys::generate();
+
+        let original = TestDatabase::build_addressable_event(&keys, "slot", 5_000, "original");
+        let original_seq = db.insert(&original);
+        assert_eq!(original_seq, 0);
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "delete addressable")
+            .tag(vec![
+                "a".to_string(),
+                format!(
+                    "030023:{}:slot",
+                    keys.public_key().to_hex().to_ascii_uppercase()
+                ),
+            ])
+            .custom_created_at(Timestamp::from_secs(6_000))
+            .sign_with_keys(&keys)
+            .expect("failed to build a-tag deletion");
+        let deletion_seq = db.insert(&deletion);
+        assert_eq!(deletion_seq, 1);
+
+        let late = TestDatabase::build_addressable_event(&keys, "slot", 5_500, "late");
+        assert_eq!(db.insert(&late), deletion_seq);
+
+        let txn = db.ro_txn();
+        db.assert_event_removed(&txn, original_seq, &original);
+        db.assert_event_absent(&txn, &late);
+        db.assert_event_stored(&txn, deletion_seq, &deletion);
+    }
+
+    #[test]
+    fn deleting_a_tag_deletion_removes_replace_deletion_marker() {
+        let db = TestDatabase::new();
+        let keys = Keys::generate();
+
+        let original = TestDatabase::build_addressable_event(&keys, "slot", 5_000, "original");
+        let original_seq = db.insert(&original);
+        assert_eq!(original_seq, 0);
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "delete addressable")
+            .tag(addressable_tag(
+                Kind::LongFormTextNote,
+                keys.public_key(),
+                "slot",
+            ))
+            .custom_created_at(Timestamp::from_secs(6_000))
+            .sign_with_keys(&keys)
+            .expect("failed to build a-tag deletion");
+        let deletion_seq = db.insert(&deletion);
+        assert_eq!(deletion_seq, 1);
+        assert_eq!(db.insert(&original), deletion_seq);
+
+        let deletion_removal = EventBuilder::delete(EventDeletionRequest::new().id(deletion.id))
+            .custom_created_at(Timestamp::from_secs(7_000))
+            .sign_with_keys(&keys)
+            .expect("failed to build deletion removal");
+        let deletion_removal_seq = db.insert(&deletion_removal);
+        assert_eq!(deletion_removal_seq, 2);
+
+        let readded_seq = db.insert(&original);
+        assert_eq!(readded_seq, 3);
+
+        let txn = db.ro_txn();
+        db.assert_event_removed(&txn, deletion_seq, &deletion);
+        db.assert_event_stored(&txn, deletion_removal_seq, &deletion_removal);
+        db.assert_event_stored(&txn, readded_seq, &original);
+    }
+
+    #[test]
+    fn deletion_by_a_tag_rejects_other_pubkey() {
+        let db = TestDatabase::new();
+        let author_keys = Keys::generate();
+        let other_keys = Keys::generate();
+
+        let deletion = EventBuilder::new(Kind::EventDeletion, "invalid")
+            .tag(addressable_tag(
+                Kind::LongFormTextNote,
+                author_keys.public_key(),
+                "slot",
+            ))
+            .custom_created_at(Timestamp::from_secs(6_000))
+            .sign_with_keys(&other_keys)
+            .expect("failed to build invalid a-tag deletion");
+
+        assert!(matches!(
+            db.insert_error(&deletion),
+            SearchnosDBError::InvalidDeletionATag(_)
+        ));
+    }
+
+    #[test]
     fn subscribe_streams_events() {
         let db = TestDatabase::new();
         let keys = Keys::generate();
@@ -1106,6 +1241,13 @@ mod tests {
 
         let received = rt.block_on(async { subscription.next().await });
         assert_eq!(received, Some(StreamItem::Event(second.as_json())));
+    }
+
+    fn addressable_tag(kind: Kind, pubkey: PublicKey, d_tag: &str) -> Vec<String> {
+        vec![
+            "a".to_string(),
+            format!("{}:{}:{d_tag}", kind.as_u32(), pubkey.to_hex()),
+        ]
     }
 
     /// Helper function for polling subscription with timeout
