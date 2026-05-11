@@ -2,8 +2,9 @@ use lmdb::{
     Cursor, Database, DatabaseFlags, Environment, RoTransaction, RwTransaction, Transaction,
 };
 
-use crate::ndb_ext::from_ndb_note;
 use crate::nostr::{EventError, Filter};
+use ndb::NdbNote;
+use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::io::{ErrorKind, Read, Write};
 use std::{mem, sync::Arc};
@@ -59,6 +60,7 @@ const SEQ_BYTES: usize = std::mem::size_of::<u64>();
 const CREATED_AT_BYTES: usize = std::mem::size_of::<u64>();
 const EXPIRATION_BYTES: usize = std::mem::size_of::<u64>();
 const DUMP_LENGTH_PREFIX_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+const LOAD_BATCH_SIZE: usize = 1024;
 
 use index::{
     ContentsStore, DeletionIndex, EventIdIndex, ExpirationIndex, ReplacableIndex,
@@ -142,6 +144,11 @@ pub struct DumpProgress {
 pub struct LoadProgress {
     pub events_loaded: u64,
     pub bytes_read: u64,
+}
+
+struct LoadedDumpRecord {
+    payload: Vec<u8>,
+    progress: LoadProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -438,25 +445,61 @@ impl SearchnosDB {
         self.flush()?;
 
         loop {
-            let Some(len) = Self::read_dump_record_length(&mut reader)? else {
+            let mut batch = Vec::with_capacity(LOAD_BATCH_SIZE);
+
+            for _ in 0..LOAD_BATCH_SIZE {
+                let Some(len) = Self::read_dump_record_length(&mut reader)? else {
+                    break;
+                };
+                bytes_read += DUMP_LENGTH_PREFIX_BYTES;
+
+                let mut payload = vec![0u8; len as usize];
+                reader.read_exact(&mut payload)?;
+                bytes_read += u64::from(len);
+
+                count += 1;
+                batch.push(LoadedDumpRecord {
+                    payload,
+                    progress: LoadProgress {
+                        events_loaded: count,
+                        bytes_read,
+                    },
+                });
+            }
+
+            if batch.is_empty() {
                 break;
-            };
-            bytes_read += DUMP_LENGTH_PREFIX_BYTES;
+            }
 
-            let mut payload = vec![0u8; len as usize];
-            reader.read_exact(&mut payload)?;
-            bytes_read += u64::from(len);
-
-            let event_json = from_ndb_note(&payload).map_err(SearchnosDBError::DecodeEvent)?;
-            self.load_event_json_immediate_owned(event_json)?;
-            count += 1;
-            on_progress(LoadProgress {
-                events_loaded: count,
-                bytes_read,
-            });
+            for progress in self.insert_loaded_dump_batch(batch)? {
+                on_progress(progress);
+            }
         }
 
         Ok(count)
+    }
+
+    fn insert_loaded_dump_batch(
+        &self,
+        batch: Vec<LoadedDumpRecord>,
+    ) -> Result<Vec<LoadProgress>, SearchnosDBError> {
+        let progress = batch.iter().map(|record| record.progress).collect();
+        let prepared = batch
+            .into_par_iter()
+            .map(|record| {
+                let note =
+                    NdbNote::from_bytes(&record.payload).map_err(SearchnosDBError::DecodeEvent)?;
+                let note_event = note.to_event().map_err(SearchnosDBError::DecodeEvent)?;
+                Self::prepare_loaded_note_insert(note_event, record.payload)
+            })
+            .collect::<Result<Vec<_>, SearchnosDBError>>()?;
+
+        let mut txn = self.begin_rw_txn()?;
+        for item in prepared {
+            self.insert_prepared(&mut txn, item)?;
+        }
+        txn.commit().map_err(SearchnosDBError::from)?;
+        Ok(progress)
     }
 
     fn read_dump_record_length<R: Read>(reader: &mut R) -> Result<Option<u32>, SearchnosDBError> {

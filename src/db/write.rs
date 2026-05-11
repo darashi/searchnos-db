@@ -7,10 +7,11 @@ use std::{
 
 use lmdb::{Cursor, RwTransaction, Transaction, WriteFlags};
 use lmdb_sys::MDB_LAST;
-use ndb::NdbNote;
+use ndb::{Event as NdbEvent, NdbNote};
 
 use crate::nostr::{
-    Event, EventId, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp, extract_note_expiration,
+    Event, EventId, JsonUtil, Kind, PublicKey, Signature, TagExt, TagKind, Tags, Timestamp,
+    extract_note_expiration,
 };
 
 use crate::ndb_ext::{
@@ -78,8 +79,15 @@ impl SearchnosDB {
         Self::prepare_insert_with_options(raw, true)
     }
 
-    pub(crate) fn prepare_insert_for_load(raw: &str) -> Result<PreparedInsert, SearchnosDBError> {
-        Self::prepare_insert_with_options(raw, false)
+    pub(crate) fn prepare_loaded_note_insert(
+        note_event: NdbEvent,
+        note_bytes: Vec<u8>,
+    ) -> Result<PreparedInsert, SearchnosDBError> {
+        Self::prepare_insert_with_note_bytes(
+            Self::event_from_ndb_event(note_event),
+            false,
+            note_bytes,
+        )
     }
 
     fn prepare_insert_with_options(
@@ -87,6 +95,15 @@ impl SearchnosDB {
         reject_invalid_replace_deletions: bool,
     ) -> Result<PreparedInsert, SearchnosDBError> {
         let event = Event::from_json(raw)?;
+        let note_bytes = to_ndb_note(raw)?;
+        Self::prepare_insert_with_note_bytes(event, reject_invalid_replace_deletions, note_bytes)
+    }
+
+    fn prepare_insert_with_note_bytes(
+        event: Event,
+        reject_invalid_replace_deletions: bool,
+        note_bytes: Vec<u8>,
+    ) -> Result<PreparedInsert, SearchnosDBError> {
         event.verify().map_err(SearchnosDBError::InvalidSignature)?;
         let index_data = EventIndexData::from_event(&event);
         let expiration = index_data.expiration;
@@ -101,8 +118,6 @@ impl SearchnosDB {
         } else {
             Vec::new()
         };
-        let note_bytes = to_ndb_note(raw)?;
-
         Ok(PreparedInsert {
             event,
             index_data,
@@ -111,6 +126,18 @@ impl SearchnosDB {
             note_bytes,
             expiration,
         })
+    }
+
+    fn event_from_ndb_event(event: NdbEvent) -> Event {
+        Event {
+            id: EventId::from(event.id),
+            pubkey: PublicKey::from_bytes(event.pubkey),
+            created_at: Timestamp::from(event.created_at),
+            kind: Kind::from_u32(event.kind),
+            tags: Tags::new(event.tags),
+            content: event.content,
+            sig: Signature::from_bytes(event.sig),
+        }
     }
 
     pub(crate) fn is_expired(expiration: u64) -> bool {
@@ -180,24 +207,6 @@ impl SearchnosDB {
         self.broadcast_note(&note, &prepared.index_data.normalized_content, &event_json);
 
         Ok(InsertResult::Inserted(seq))
-    }
-
-    pub(crate) fn load_event_json_immediate_owned(
-        &self,
-        event_json: String,
-    ) -> Result<InsertResult, SearchnosDBError> {
-        let prepared = Self::prepare_insert_for_load(&event_json)?;
-        self.insert_prepared_immediate(prepared)
-    }
-
-    fn insert_prepared_immediate(
-        &self,
-        prepared: PreparedInsert,
-    ) -> Result<InsertResult, SearchnosDBError> {
-        let mut txn = self.begin_rw_txn()?;
-        let result = self.insert_prepared(&mut txn, prepared)?;
-        txn.commit().map_err(SearchnosDBError::from)?;
-        Ok(result)
     }
 
     fn validate_event_for_insertion(

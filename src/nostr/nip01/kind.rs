@@ -14,6 +14,10 @@ impl Kind {
         Self(value as u32)
     }
 
+    pub fn from_u32(value: u32) -> Self {
+        Self(value)
+    }
+
     pub fn as_u16(self) -> u16 {
         self.0 as u16
     }
