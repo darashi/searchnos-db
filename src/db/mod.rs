@@ -149,6 +149,7 @@ pub struct LoadProgress {
 struct LoadedDumpRecord {
     payload: Vec<u8>,
     progress: LoadProgress,
+    payload_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +454,7 @@ impl SearchnosDB {
                 };
                 bytes_read += DUMP_LENGTH_PREFIX_BYTES;
 
+                let payload_offset = bytes_read;
                 let mut payload = vec![0u8; len as usize];
                 reader.read_exact(&mut payload)?;
                 bytes_read += u64::from(len);
@@ -464,6 +466,7 @@ impl SearchnosDB {
                         events_loaded: count,
                         bytes_read,
                     },
+                    payload_offset,
                 });
             }
 
@@ -487,19 +490,52 @@ impl SearchnosDB {
         let prepared = batch
             .into_par_iter()
             .map(|record| {
-                let note =
-                    NdbNote::from_bytes(&record.payload).map_err(SearchnosDBError::DecodeEvent)?;
-                let note_event = note.to_event().map_err(SearchnosDBError::DecodeEvent)?;
-                Self::prepare_loaded_note_insert(note_event, record.payload)
+                let progress = record.progress;
+                let payload_offset = record.payload_offset;
+                let prepared = Self::prepare_loaded_dump_record(record);
+                (progress, payload_offset, prepared)
             })
-            .collect::<Result<Vec<_>, SearchnosDBError>>()?;
+            .collect::<Vec<_>>();
+
+        let mut valid = Vec::with_capacity(prepared.len());
+        for (progress, payload_offset, result) in prepared {
+            match result {
+                Ok(item) => valid.push(item),
+                Err(err) if Self::is_load_record_error(&err) => {
+                    eprintln!(
+                        "warning: skipping dump record {} at payload offset {}: {}",
+                        progress.events_loaded, payload_offset, err
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         let mut txn = self.begin_rw_txn()?;
-        for item in prepared {
+        for item in valid {
             self.insert_prepared(&mut txn, item)?;
         }
         txn.commit().map_err(SearchnosDBError::from)?;
         Ok(progress)
+    }
+
+    fn prepare_loaded_dump_record(
+        record: LoadedDumpRecord,
+    ) -> Result<write::PreparedInsert, SearchnosDBError> {
+        let note = NdbNote::from_bytes(&record.payload).map_err(SearchnosDBError::DecodeEvent)?;
+        let note_event = note.to_event().map_err(SearchnosDBError::DecodeEvent)?;
+        Self::prepare_loaded_note_insert(note_event, record.payload)
+    }
+
+    fn is_load_record_error(err: &SearchnosDBError) -> bool {
+        matches!(
+            err,
+            SearchnosDBError::ParseEvent(_)
+                | SearchnosDBError::InvalidSignature(_)
+                | SearchnosDBError::DecodeEvent(_)
+                | SearchnosDBError::InvalidDeletionATag(_)
+                | SearchnosDBError::InvalidUtf8Content(_)
+        )
     }
 
     fn read_dump_record_length<R: Read>(reader: &mut R) -> Result<Option<u32>, SearchnosDBError> {
@@ -579,7 +615,8 @@ mod tests {
     };
     use crate::ndb_ext::to_ndb_note;
     use crate::nostr::{
-        Event, EventDeletionRequest, Filter, JsonUtil, Kind, Metadata, PublicKey, Timestamp,
+        Event, EventDeletionRequest, EventId, Filter, JsonUtil, Kind, Metadata, PublicKey,
+        Timestamp,
         test_utils::{EventBuilder, Keys},
     };
 
@@ -772,6 +809,39 @@ mod tests {
         assert_eq!(progress[0].events_loaded, 1);
         assert_eq!(progress[1].events_loaded, 2);
         assert_eq!(progress[1].bytes_read as usize, dumped.len());
+    }
+
+    #[test]
+    fn load_events_skips_invalid_event_records() {
+        let keys = Keys::generate();
+        let first = EventBuilder::text_note("first valid loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build first event");
+        let mut invalid = EventBuilder::text_note("invalid loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build invalid event");
+        invalid.id = EventId::from([1; 32]);
+        let second = EventBuilder::text_note("second valid loaded note")
+            .sign_with_keys(&keys)
+            .expect("failed to build second event");
+
+        let mut dumped = Vec::new();
+        append_dump_record(&mut dumped, &first);
+        append_dump_record(&mut dumped, &invalid);
+        append_dump_record(&mut dumped, &second);
+
+        let destination = TestDatabase::new();
+        let progress = destination.load_events_with_progress(&dumped);
+
+        let loaded_events = destination.query(&[Filter::new().search("valid loaded")]);
+        assert_eq!(loaded_events.len(), 2);
+        let skipped_events = destination.query(&[Filter::new().id(invalid.id)]);
+        assert!(skipped_events.is_empty());
+        assert_eq!(progress.len(), 3);
+        assert_eq!(progress[0].events_loaded, 1);
+        assert_eq!(progress[1].events_loaded, 2);
+        assert_eq!(progress[2].events_loaded, 3);
+        assert_eq!(progress[2].bytes_read as usize, dumped.len());
     }
 
     #[test]
