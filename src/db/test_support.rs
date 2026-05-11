@@ -1,4 +1,5 @@
 use std::convert::TryInto;
+use std::sync::Arc;
 
 use crate::text::{extract_text, normalize_text};
 
@@ -17,20 +18,26 @@ use serde_json::to_string as to_json_string;
 
 pub(crate) struct TestDatabase {
     _dir: tempfile::TempDir,
-    db: SearchnosDB,
+    db: Arc<SearchnosDB>,
 }
 
 impl TestDatabase {
     pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let db = SearchnosDB::open(dir.path()).expect("failed to open db");
-        Self { _dir: dir, db }
+        Self {
+            _dir: dir,
+            db: Arc::new(db),
+        }
     }
 
     pub(crate) fn with_options(options: SearchnosDBOptions) -> Self {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let db = SearchnosDB::open_with_options(dir.path(), options).expect("failed to open db");
-        Self { _dir: dir, db }
+        Self {
+            _dir: dir,
+            db: Arc::new(db),
+        }
     }
 
     pub(crate) fn insert(&self, event: &Event) -> u64 {
@@ -162,7 +169,7 @@ impl TestDatabase {
 
     pub(crate) fn subscribe(&self, filters: &[Filter]) -> Subscription {
         let json = to_json_string(filters).expect("failed to encode filters");
-        self.db.subscribe(&json).expect("subscribe failed")
+        self.db.clone().subscribe(&json).expect("subscribe failed")
     }
 
     pub(crate) fn ro_txn(&self) -> RoTransaction<'_> {

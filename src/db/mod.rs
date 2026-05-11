@@ -7,10 +7,9 @@ use ndb::NdbNote;
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::io::{ErrorKind, Read, Write};
+use std::thread;
 use std::{mem, sync::Arc};
 use std::{path::Path, sync::Mutex, time::Duration};
-
-use tokio::task::JoinError;
 
 mod batch;
 mod index;
@@ -120,8 +119,6 @@ pub enum SearchnosDBError {
     InvalidUtf8Content(#[from] std::str::Utf8Error),
     #[error("batch state is poisoned")]
     BatchStatePoisoned,
-    #[error("async task join error: {0}")]
-    AsyncJoin(#[from] JoinError),
 }
 
 #[derive(Debug, Clone)]
@@ -233,10 +230,11 @@ impl SearchnosDB {
 
     /// Subscribe to filters, delivering snapshot events followed by an EOSE marker before live updates.
     pub fn subscribe(
-        &self,
+        self: Arc<Self>,
         filters_json: &str,
     ) -> Result<subscription::Subscription, SearchnosDBError> {
-        let filters = Self::parse_filters_json(filters_json)?;
+        let filters_json = filters_json.to_owned();
+        let filters = Self::parse_filters_json(&filters_json)?;
         let filter_set = if filters.is_empty() {
             Vec::new()
         } else {
@@ -245,39 +243,41 @@ impl SearchnosDB {
         let (id, receiver, sender) = self.subscriptions.register(filter_set);
         let subscription =
             subscription::Subscription::new(id, receiver, self.subscriptions.clone());
+        let db = self.clone();
 
-        match self.query(filters_json) {
-            Ok(events) => {
-                for event_json in events {
+        thread::spawn(move || {
+            let mut receiver_open = true;
+            let result = db.stream_query(&filters_json, |event_json| {
+                if sender
+                    .blocking_send(subscription::StreamItem::Event(event_json))
+                    .is_err()
+                {
+                    receiver_open = false;
+                    return false;
+                }
+                true
+            });
+
+            match result {
+                Ok(()) if receiver_open => {
                     if sender
-                        .try_send(subscription::StreamItem::Event(event_json))
+                        .blocking_send(subscription::StreamItem::Eose)
                         .is_err()
                     {
-                        self.subscriptions.unregister(id);
-                        return Ok(subscription);
+                        db.subscriptions.unregister(id);
                     }
                 }
-
-                if sender.try_send(subscription::StreamItem::Eose).is_err() {
-                    self.subscriptions.unregister(id);
+                Ok(()) => {
+                    db.subscriptions.unregister(id);
                 }
-
-                Ok(subscription)
+                Err(err) => {
+                    db.subscriptions.unregister(id);
+                    eprintln!("failed to stream subscription snapshot: {err}");
+                }
             }
-            Err(err) => {
-                self.subscriptions.unregister(id);
-                Err(err)
-            }
-        }
-    }
+        });
 
-    /// Async wrapper around `subscribe` that offloads blocking work.
-    pub async fn subscribe_async(
-        self: Arc<Self>,
-        filters_json: &str,
-    ) -> Result<subscription::Subscription, SearchnosDBError> {
-        let filters_json = filters_json.to_owned();
-        tokio::task::spawn_blocking(move || self.subscribe(&filters_json)).await?
+        Ok(subscription)
     }
 
     fn effective_limit(&self, provided: Option<usize>) -> Option<usize> {
@@ -859,7 +859,7 @@ mod tests {
         let filters = vec![Filter::new().author(keys.public_key())];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected initial EOSE, got {:?}", other),
         }
@@ -872,7 +872,7 @@ mod tests {
         let result = db.insert_allow_drop(&event);
         assert!(result.is_none(), "ephemeral events should not persist");
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Event(json)) => assert_eq!(json, event.as_json()),
             other => panic!("expected live ephemeral event, got {:?}", other),
         }
@@ -1346,11 +1346,11 @@ mod tests {
         let filters = vec![Filter::new().author(keys.public_key())];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Event(event)) => assert_eq!(event, first.as_json()),
             other => panic!("expected snapshot event, got {:?}", other),
         }
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
@@ -1379,17 +1379,25 @@ mod tests {
         out.extend_from_slice(&payload);
     }
 
+    fn wait_for_item(subscription: &mut Subscription, timeout_ms: u64) -> Option<StreamItem> {
+        let iterations = timeout_ms / 10;
+        for _ in 0..iterations {
+            if let Some(item) = subscription.try_next() {
+                return Some(item);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
     /// Helper function for polling subscription with timeout
     fn wait_for_event(subscription: &mut Subscription, timeout_ms: u64) -> Result<String, String> {
         let iterations = timeout_ms / 10;
         for _ in 0..iterations {
-            if let Some(item) = subscription.try_next() {
-                match item {
-                    StreamItem::Event(json) => return Ok(json),
-                    StreamItem::Eose => {}
-                }
+            match wait_for_item(subscription, 10) {
+                Some(StreamItem::Event(json)) => return Ok(json),
+                Some(StreamItem::Eose) | None => {}
             }
-            thread::sleep(Duration::from_millis(10));
         }
         Err("timed out waiting for matching event".to_string())
     }
@@ -1407,7 +1415,7 @@ mod tests {
         let filters = vec![Filter::new().limit(0)];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
@@ -1435,7 +1443,7 @@ mod tests {
         let filters = vec![Filter::new().search(search_query)];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
@@ -1470,7 +1478,7 @@ mod tests {
         let filters = vec![Filter::new().search("！")];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
@@ -1517,7 +1525,7 @@ mod tests {
         let filters = vec![Filter::new().search("rust programming")];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
@@ -1563,7 +1571,7 @@ mod tests {
         let filters = vec![Filter::new().search("hello world")];
         let mut subscription = db.subscribe(&filters);
 
-        match subscription.try_next() {
+        match wait_for_item(&mut subscription, 1000) {
             Some(StreamItem::Eose) => {}
             other => panic!("expected EOSE, got {:?}", other),
         }
