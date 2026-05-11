@@ -6,6 +6,6 @@ mod text;
 pub use db::{
     DatabaseStats, DumpProgress, FilterStats, LoadProgress, PurgePolicy, PurgeSpecError,
     QueryResult, QueryStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem,
-    Subscription, SubscriptionWithStats,
+    Subscription,
 };
 pub use ndb_ext::MatchEventOptions;

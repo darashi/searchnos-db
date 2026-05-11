@@ -174,11 +174,6 @@ pub struct FilterStats {
     pub candidate_count: usize,
 }
 
-pub struct SubscriptionWithStats {
-    pub subscription: Subscription,
-    pub initial_query: QueryStats,
-}
-
 impl SearchnosDB {
     /// Open a database at `path` using default options, creating it if necessary.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SearchnosDBError> {
@@ -237,10 +232,10 @@ impl SearchnosDB {
     }
 
     /// Subscribe to filters, delivering snapshot events followed by an EOSE marker before live updates.
-    pub fn subscribe_with_stats(
+    pub fn subscribe(
         &self,
         filters_json: &str,
-    ) -> Result<SubscriptionWithStats, SearchnosDBError> {
+    ) -> Result<subscription::Subscription, SearchnosDBError> {
         let filters = Self::parse_filters_json(filters_json)?;
         let filter_set = if filters.is_empty() {
             Vec::new()
@@ -251,31 +246,23 @@ impl SearchnosDB {
         let subscription =
             subscription::Subscription::new(id, receiver, self.subscriptions.clone());
 
-        match self.query_with_stats(filters_json) {
-            Ok(QueryResult { events, stats }) => {
+        match self.query(filters_json) {
+            Ok(events) => {
                 for event_json in events {
                     if sender
                         .try_send(subscription::StreamItem::Event(event_json))
                         .is_err()
                     {
-                        // Channel closed or full, stop sending
                         self.subscriptions.unregister(id);
-                        return Ok(SubscriptionWithStats {
-                            subscription,
-                            initial_query: stats,
-                        });
+                        return Ok(subscription);
                     }
                 }
 
                 if sender.try_send(subscription::StreamItem::Eose).is_err() {
-                    // Channel closed or full, stop sending
                     self.subscriptions.unregister(id);
                 }
 
-                Ok(SubscriptionWithStats {
-                    subscription,
-                    initial_query: stats,
-                })
+                Ok(subscription)
             }
             Err(err) => {
                 self.subscriptions.unregister(id);
@@ -284,30 +271,13 @@ impl SearchnosDB {
         }
     }
 
-    pub fn subscribe(
-        &self,
-        filters_json: &str,
-    ) -> Result<subscription::Subscription, SearchnosDBError> {
-        self.subscribe_with_stats(filters_json)
-            .map(|result| result.subscription)
-    }
-
     /// Async wrapper around `subscribe` that offloads blocking work.
-    pub async fn subscribe_async_with_stats(
-        self: Arc<Self>,
-        filters_json: &str,
-    ) -> Result<SubscriptionWithStats, SearchnosDBError> {
-        let filters_json = filters_json.to_owned();
-        tokio::task::spawn_blocking(move || self.subscribe_with_stats(&filters_json)).await?
-    }
-
     pub async fn subscribe_async(
         self: Arc<Self>,
         filters_json: &str,
     ) -> Result<subscription::Subscription, SearchnosDBError> {
-        self.subscribe_async_with_stats(filters_json)
-            .await
-            .map(|result| result.subscription)
+        let filters_json = filters_json.to_owned();
+        tokio::task::spawn_blocking(move || self.subscribe(&filters_json)).await?
     }
 
     fn effective_limit(&self, provided: Option<usize>) -> Option<usize> {
@@ -1416,7 +1386,7 @@ mod tests {
             if let Some(item) = subscription.try_next() {
                 match item {
                     StreamItem::Event(json) => return Ok(json),
-                    other => return Err(format!("unexpected stream item: {:?}", other)),
+                    StreamItem::Eose => {}
                 }
             }
             thread::sleep(Duration::from_millis(10));
@@ -1429,10 +1399,10 @@ mod tests {
         let db = TestDatabase::new();
         let keys = Keys::generate();
 
-        let snapshot_event = EventBuilder::text_note("snapshot")
+        let existing_event = EventBuilder::text_note("existing")
             .sign_with_keys(&keys)
-            .expect("failed to build snapshot event");
-        db.insert(&snapshot_event);
+            .expect("failed to build existing event");
+        db.insert(&existing_event);
 
         let filters = vec![Filter::new().limit(0)];
         let mut subscription = db.subscribe(&filters);
@@ -1458,7 +1428,6 @@ mod tests {
         }
     }
 
-    /// Test helper for search queries after EOSE
     fn test_search_after_eose(search_query: &str, content: &str) {
         let db = TestDatabase::new();
         let keys = Keys::generate();
