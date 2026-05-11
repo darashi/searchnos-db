@@ -7,13 +7,13 @@ use std::{
 
 use lmdb::{Cursor, RwTransaction, Transaction, WriteFlags};
 use lmdb_sys::MDB_LAST;
-use ndb::{NdbNote, TagElement};
+use ndb::NdbNote;
 
 use crate::nostr::{
     Event, EventId, JsonUtil, Kind, PublicKey, TagExt, TagKind, Timestamp, extract_note_expiration,
 };
 
-use crate::ndb_ext::{tag_text, to_ndb_note};
+use crate::ndb_ext::{note_deletion_ids, note_event_index_key, note_replacable_key, to_ndb_note};
 
 use super::{
     KEY_BYTES, SEQ_BYTES, SearchnosDB, SearchnosDBError,
@@ -391,96 +391,6 @@ impl SearchnosDB {
         key
     }
 
-    fn note_event_index_key(note: &NdbNote<'_>) -> Vec<u8> {
-        let mut key = note.id().to_vec();
-        key.extend_from_slice(&note.created_at().to_be_bytes());
-        key
-    }
-
-    fn first_note_d_tag_bytes(note: &NdbNote<'_>) -> Option<Vec<u8>> {
-        for tag in note.tags() {
-            let Ok(tag) = tag else {
-                continue;
-            };
-            let mut elements = tag.elements();
-            let Some(Ok(identifier)) = elements.next() else {
-                continue;
-            };
-            if tag_text(identifier) != Some("d") {
-                continue;
-            }
-
-            return match elements.next() {
-                Some(Ok(TagElement::Text(value))) => Some(value.as_bytes().to_vec()),
-                Some(Ok(TagElement::Id(value))) => Some(value.to_vec()),
-                Some(Err(_)) | None => Some(Vec::new()),
-            };
-        }
-
-        None
-    }
-
-    fn replacable_key_from_note(note: &NdbNote<'_>) -> Option<Vec<u8>> {
-        let kind_value = note.kind();
-        if kind_value > u16::MAX as u32 {
-            return None;
-        }
-
-        let kind = Kind::from_u16(kind_value as u16);
-        let is_replaceable = kind.is_replaceable();
-        let is_addressable = kind.is_addressable();
-
-        if !is_replaceable && !is_addressable {
-            return None;
-        }
-
-        let slot = if is_addressable {
-            Self::first_note_d_tag_bytes(note).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let pubkey = note.pubkey();
-        let mut key = Vec::with_capacity(pubkey.len() + 2 + 4 + slot.len());
-        key.extend_from_slice(pubkey);
-        key.extend_from_slice(&(kind_value as u16).to_be_bytes());
-        key.extend_from_slice(&(slot.len() as u32).to_be_bytes());
-        key.extend_from_slice(&slot);
-        Some(key)
-    }
-
-    fn collect_note_deletion_ids(note: &NdbNote<'_>) -> Vec<[u8; 32]> {
-        let mut ids = Vec::new();
-
-        for tag in note.tags() {
-            let Ok(tag) = tag else {
-                continue;
-            };
-            let mut elements = tag.elements();
-            let Some(Ok(identifier)) = elements.next() else {
-                continue;
-            };
-            if tag_text(identifier) != Some("e") {
-                continue;
-            }
-
-            let Some(Ok(value)) = elements.next() else {
-                continue;
-            };
-            match value {
-                TagElement::Id(id) => ids.push(*id),
-                TagElement::Text(text) => {
-                    let mut id = [0u8; 32];
-                    if hex::decode_to_slice(text, &mut id).is_ok() {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-
-        ids
-    }
-
     fn apply_deletions<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
@@ -547,13 +457,13 @@ impl SearchnosDB {
 
         let (event_index_key, expiration, deletion_marker_keys, replacable_key, created_at) = {
             let note = NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-            let event_index_key = Self::note_event_index_key(&note);
+            let event_index_key = note_event_index_key(&note);
             let expiration = extract_note_expiration(&note);
             let deletion_marker_keys = if remove_deletion_markers {
                 let mut keys = Vec::new();
                 if note.kind() == Kind::EventDeletion.as_u32() {
                     keys.extend(
-                        Self::collect_note_deletion_ids(&note)
+                        note_deletion_ids(&note)
                             .into_iter()
                             .map(|id| Self::deletion_marker_key_bytes(&id, note.pubkey())),
                     );
@@ -563,7 +473,7 @@ impl SearchnosDB {
             } else {
                 Vec::new()
             };
-            let replacable_key = Self::replacable_key_from_note(&note);
+            let replacable_key = note_replacable_key(&note);
             let created_at = note.created_at();
 
             (
