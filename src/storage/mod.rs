@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,7 @@ mod partition;
 mod query;
 mod reindex;
 mod search;
+mod sidecar_queue;
 mod text;
 mod visibility;
 use cursor::{PacketCursor, best_day_cursor_index};
@@ -42,6 +43,7 @@ use search::{
     remove_file_if_exists, search_bloom_may_match, search_index_path, search_sidecar_is_current,
     tmp_search_index_path, write_built_search_index,
 };
+use sidecar_queue::SidecarUpdateQueue;
 use visibility::{VisibilityIndex, VisibilityStore, VisibilitySummary, visibility_store_path};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
@@ -214,78 +216,6 @@ struct StreamingFilterState<'a> {
     rebuilt_search_sidecars: u64,
     bloom_skipped_partitions: u64,
     searched_partitions: u64,
-}
-
-struct SidecarUpdateQueue {
-    state: Mutex<SidecarUpdateState>,
-    available: Condvar,
-}
-
-#[derive(Default)]
-struct SidecarUpdateState {
-    active: bool,
-    pending_compactions: u64,
-}
-
-enum SidecarUpdateKind {
-    Compaction,
-    Reindex,
-}
-
-struct SidecarUpdateGuard<'a> {
-    queue: &'a SidecarUpdateQueue,
-}
-
-impl SidecarUpdateQueue {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(SidecarUpdateState::default()),
-            available: Condvar::new(),
-        }
-    }
-
-    fn acquire_compaction(&self) -> Result<SidecarUpdateGuard<'_>, Box<dyn Error>> {
-        self.acquire(SidecarUpdateKind::Compaction)
-    }
-
-    fn acquire_reindex(&self) -> Result<SidecarUpdateGuard<'_>, Box<dyn Error>> {
-        self.acquire(SidecarUpdateKind::Reindex)
-    }
-
-    fn acquire(&self, kind: SidecarUpdateKind) -> Result<SidecarUpdateGuard<'_>, Box<dyn Error>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        if matches!(kind, SidecarUpdateKind::Compaction) {
-            state.pending_compactions += 1;
-        }
-
-        while state.active
-            || (matches!(kind, SidecarUpdateKind::Reindex) && state.pending_compactions > 0)
-        {
-            state = self
-                .available
-                .wait(state)
-                .map_err(|err| io::Error::other(err.to_string()))?;
-        }
-
-        if matches!(kind, SidecarUpdateKind::Compaction) {
-            state.pending_compactions -= 1;
-        }
-        state.active = true;
-        Ok(SidecarUpdateGuard { queue: self })
-    }
-}
-
-impl Drop for SidecarUpdateGuard<'_> {
-    fn drop(&mut self) {
-        let Ok(mut state) = self.queue.state.lock() else {
-            return;
-        };
-        state.active = false;
-        self.queue.available.notify_all();
-    }
 }
 
 impl HotEvents {
