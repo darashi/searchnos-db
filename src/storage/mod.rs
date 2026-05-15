@@ -12,6 +12,7 @@ mod hot;
 mod partition;
 mod query;
 mod reindex;
+mod reindex_runner;
 mod search;
 mod sidecar_queue;
 mod streaming_query;

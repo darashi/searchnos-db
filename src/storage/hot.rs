@@ -4,7 +4,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use tracing::info;
@@ -18,16 +18,15 @@ use super::compaction::{
 use super::event::{
     EventPacket, error_with_path, read_event_packets, read_event_packets_from_path,
 };
-use super::partition::{orphaned_compacting_hot_paths, partition_event_paths, partition_path};
-use super::reindex::{ReindexJob, reindex_partition};
+use super::partition::{orphaned_compacting_hot_paths, partition_path};
 use super::search::{
     SearchIndex, append_to_search_index, build_search_index, remove_file_if_exists,
-    search_index_path, search_sidecar_is_current,
+    search_index_path,
 };
 use super::sidecar_queue::SidecarUpdateQueue;
 use super::text;
 use super::visibility::{VisibilityStore, visibility_store_path};
-use super::{CompactStats, NegentropyItem, ReindexProgress, ReindexProgressPhase, ReindexStats};
+use super::{CompactStats, NegentropyItem};
 
 const DEFAULT_STORAGE_DIR: &str = "data";
 const HOT_EVENTS_FILE: &str = "hot.events";
@@ -42,7 +41,7 @@ pub(crate) struct HotEvents {
     pub(crate) searchable_kinds: Option<Vec<u32>>,
     pub(crate) visibility_store: Arc<VisibilityStore>,
     state: Arc<Mutex<HotState>>,
-    sidecar_updates: Arc<SidecarUpdateQueue>,
+    pub(crate) sidecar_updates: Arc<SidecarUpdateQueue>,
     compact_running: Arc<AtomicBool>,
     compact_pending: Arc<AtomicBool>,
     compacting_paths: Arc<Mutex<Vec<PathBuf>>>,
@@ -374,21 +373,6 @@ impl HotEvents {
         Ok(packets)
     }
 
-    pub(crate) fn rebuild_partition_sidecars(&self, path: &Path) -> Result<u64, Box<dyn Error>> {
-        let _sidecar_updates = self.sidecar_updates.acquire_reindex()?;
-        let result = reindex_partition(
-            ReindexJob {
-                path: path.to_path_buf(),
-                file_index: 0,
-            },
-            self.searchable_kinds.as_deref(),
-        )?;
-        self.visibility_store
-            .merge_summary(&result.visibility_summary)
-            .map_err(|err| error_with_path("write visibility index", &self.partitions_dir, err))?;
-        Ok(result.events)
-    }
-
     pub(crate) fn hot_snapshot(&self) -> Result<(Vec<EventPacket>, SearchIndex), Box<dyn Error>> {
         let mut state = self
             .state
@@ -425,86 +409,6 @@ impl HotEvents {
         items.sort_unstable();
         items.dedup_by_key(|(_, id)| *id);
         Ok(items)
-    }
-
-    pub(crate) fn reindex(
-        &self,
-        force: bool,
-        mut progress: impl FnMut(ReindexProgress),
-    ) -> Result<ReindexStats, Box<dyn Error>> {
-        let mut stats = ReindexStats::default();
-
-        let partition_paths = partition_event_paths(&self.partitions_dir)?;
-        let file_total = partition_paths.len() as u64;
-        let mut reindex_jobs = Vec::new();
-        let mut last_plan_log = Instant::now();
-
-        info!(file_total, force, "checking partition index freshness");
-
-        for (index, path) in partition_paths.iter().enumerate() {
-            let file_index = index as u64 + 1;
-            if file_index == 1 || last_plan_log.elapsed() >= Duration::from_secs(10) {
-                info!(
-                    path = %path.display(),
-                    file_index,
-                    file_total,
-                    "checking partition index freshness"
-                );
-                last_plan_log = Instant::now();
-            }
-
-            if !force && search_sidecar_is_current(path, self.searchable_kinds.as_deref())? {
-                stats.skipped_files += 1;
-                progress(ReindexProgress {
-                    phase: ReindexProgressPhase::Skipped,
-                    path: path.clone(),
-                    file_index,
-                    file_total,
-                    events: 0,
-                });
-                continue;
-            }
-
-            reindex_jobs.push(ReindexJob {
-                path: path.clone(),
-                file_index,
-            });
-        }
-
-        info!(
-            files = reindex_jobs.len(),
-            skipped_files = stats.skipped_files,
-            file_total,
-            "planned partition index updates"
-        );
-
-        for job in reindex_jobs {
-            progress(ReindexProgress {
-                phase: ReindexProgressPhase::Started,
-                path: job.path.clone(),
-                file_index: job.file_index,
-                file_total,
-                events: 0,
-            });
-            let _sidecar_updates = self.sidecar_updates.acquire_reindex()?;
-            let result = reindex_partition(job, self.searchable_kinds.as_deref())?;
-            self.visibility_store
-                .merge_summary(&result.visibility_summary)
-                .map_err(|err| {
-                    error_with_path("write visibility index", &self.partitions_dir, err)
-                })?;
-            stats.files += 1;
-            stats.events += result.events;
-            progress(ReindexProgress {
-                phase: ReindexProgressPhase::Finished,
-                path: result.path,
-                file_index: result.file_index,
-                file_total,
-                events: result.events,
-            });
-        }
-
-        Ok(stats)
     }
 }
 
