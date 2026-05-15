@@ -275,9 +275,7 @@ pub(crate) fn append_to_search_index(
         packet_len: data.len().try_into()?,
     });
     if let SearchBloom::Owned(bits) = &mut index.bloom {
-        for gram in search_bloom_text_grams(&text) {
-            insert_bloom_gram(bits, gram.as_bytes());
-        }
+        insert_search_bloom_text_grams(bits, &text);
     }
     index.text.extend_from_slice(&text);
     index.offsets.push(index.text.len() as u64);
@@ -423,9 +421,7 @@ impl SearchIndexWriter {
             .write_all(&self.fingerprint.bytes.to_le_bytes())?;
         let packet_len = u32::try_from(data.len())?;
         self.records_file.write_all(&packet_len.to_le_bytes())?;
-        for gram in search_bloom_text_grams(&text) {
-            insert_bloom_gram(&mut self.bloom, gram.as_bytes());
-        }
+        insert_search_bloom_text_grams(&mut self.bloom, &text);
         self.text_file.write_all(&text)?;
         self.text_bytes += text.len() as u64;
         self.offsets_file
@@ -848,10 +844,40 @@ impl SearchBloom {
 
 fn search_bloom_bits(text: &[u8]) -> Vec<u8> {
     let mut bits = vec![0; SEARCH_BLOOM_BYTES];
-    for gram in search_bloom_text_grams(text) {
-        insert_bloom_gram(&mut bits, gram.as_bytes());
-    }
+    insert_search_bloom_text_grams(&mut bits, text);
     bits
+}
+
+fn insert_search_bloom_text_grams(bits: &mut [u8], text: &[u8]) {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return;
+    };
+    for term in text.split(' ').filter(|term| !term.is_empty()) {
+        insert_search_bloom_term_grams(bits, term);
+    }
+}
+
+fn insert_search_bloom_term_grams(bits: &mut [u8], term: &str) {
+    let mut char_count = 0;
+    let mut previous_start = None;
+    let mut previous_previous_start = None;
+
+    for (start, ch) in term.char_indices() {
+        char_count += 1;
+        let end = start + ch.len_utf8();
+        if let Some(previous_start) = previous_start {
+            insert_bloom_gram(bits, &term.as_bytes()[previous_start..end]);
+        }
+        if let Some(previous_previous_start) = previous_previous_start {
+            insert_bloom_gram(bits, &term.as_bytes()[previous_previous_start..end]);
+        }
+        previous_previous_start = previous_start;
+        previous_start = Some(start);
+    }
+
+    if char_count == 1 {
+        insert_bloom_gram(bits, term.as_bytes());
+    }
 }
 
 fn insert_bloom_gram(bits: &mut [u8], gram: &[u8]) {
@@ -881,17 +907,6 @@ fn search_bloom_query_grams(query: &str) -> Vec<String> {
     }
     grams.sort();
     grams.dedup();
-    grams
-}
-
-fn search_bloom_text_grams(text: &[u8]) -> Vec<String> {
-    let Ok(text) = std::str::from_utf8(text) else {
-        return Vec::new();
-    };
-    let mut grams = Vec::new();
-    for term in text.split(' ').filter(|term| !term.is_empty()) {
-        append_search_bloom_grams(term, &mut grams);
-    }
     grams
 }
 
