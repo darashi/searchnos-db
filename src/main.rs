@@ -19,6 +19,14 @@ struct Cli {
 enum Command {
     /// Display database statistics
     Stat,
+    /// Compact the current hot event file into partition files
+    Compact,
+    /// Rebuild partition search and visibility sidecars
+    Reindex {
+        /// Rebuild every partition sidecar even if it appears current
+        #[arg(long)]
+        force: bool,
+    },
     /// Dump stored ndb notes as length-prefixed binary records
     Dump {
         /// Path to the output dump file
@@ -60,6 +68,8 @@ fn run() -> Result<(), CliError> {
 
     match command {
         Command::Stat => cmd::stat::run(&db_path),
+        Command::Compact => cmd::compact::run(&db_path),
+        Command::Reindex { force } => cmd::reindex::run(&db_path, force),
         Command::Dump { output_path } => cmd::dump::run(&db_path, &output_path),
         Command::Load { input_path } => cmd::load::run(&db_path, &input_path),
         Command::Query { filters } => cmd::query::run(&db_path, filters),

@@ -79,6 +79,23 @@ cargo run -- --db-path ./data stat
 
 Prints the number of currently query-visible events and the total bytes of their `ndb_note` payloads. This is not an LMDB page-level report.
 
+### Compact hot events
+
+```bash
+cargo run -- --db-path ./data compact
+```
+
+Moves the current `hot.events` contents into per-day partition files immediately, even when the hot file has not reached the automatic compaction size.
+
+### Rebuild indexes
+
+```bash
+cargo run -- --db-path ./data reindex
+cargo run -- --db-path ./data reindex --force
+```
+
+Rebuilds missing, stale, or unreadable partition sidecars. Use `--force` to rebuild every partition sidecar.
+
 ### Import events
 
 ```bash
@@ -127,6 +144,14 @@ let db = SearchnosDB::open("./data")?;
 
 let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":[],"created_at":0,"sig":"..."}"#;
 db.insert_event_json(raw_event)?;
+```
+
+Maintenance operations are also available from Rust:
+
+```rust
+db.compact()?;
+db.reindex()?;
+db.reindex_all()?;
 ```
 
 ### Query from Rust

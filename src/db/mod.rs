@@ -1,5 +1,6 @@
 use crate::ndb_ext::{from_ndb_note, to_ndb_note_buf, verify_note};
 use crate::nostr::{EventError, Filter};
+pub use crate::storage::{CompactStats, ReindexProgress, ReindexProgressPhase, ReindexStats};
 use crate::storage::{DEFAULT_HOT_MAX_BYTES, Storage};
 use serde_json::{Map, Value};
 use std::error::Error;
@@ -213,6 +214,31 @@ impl SearchnosDB {
 
     pub fn flush(&self) -> Result<(), SearchnosDBError> {
         Ok(())
+    }
+
+    pub fn compact(&self) -> Result<CompactStats, SearchnosDBError> {
+        self.storage.compact().map_err(Self::storage_error)
+    }
+
+    pub fn reindex(&self) -> Result<ReindexStats, SearchnosDBError> {
+        self.reindex_with_progress(false, |_| {})
+    }
+
+    pub fn reindex_all(&self) -> Result<ReindexStats, SearchnosDBError> {
+        self.reindex_with_progress(true, |_| {})
+    }
+
+    pub fn reindex_with_progress<F>(
+        &self,
+        force: bool,
+        on_progress: F,
+    ) -> Result<ReindexStats, SearchnosDBError>
+    where
+        F: FnMut(ReindexProgress),
+    {
+        self.storage
+            .reindex_with_progress(force, on_progress)
+            .map_err(Self::storage_error)
     }
 
     pub fn query(&self, filters_json: &str) -> Result<Vec<String>, SearchnosDBError> {

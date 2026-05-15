@@ -75,6 +75,10 @@ impl Storage {
         self.hot_events.append_packet(data)
     }
 
+    pub fn compact(&self) -> Result<CompactStats, Box<dyn Error>> {
+        self.hot_events.compact()
+    }
+
     pub fn query(&self, filters: &[Filter]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         let mut packets = Vec::new();
         self.query_streaming(filters, |packet| {
@@ -144,6 +148,13 @@ impl Storage {
             )?,
         })
     }
+}
+
+#[derive(Debug, Default)]
+pub struct CompactStats {
+    pub files: u64,
+    pub events: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -607,7 +618,7 @@ impl HotEvents {
                 hot_bytes,
                 "recovering compacting hot events file"
             );
-            let output_partitions = compact_hot_file(
+            let output = compact_hot_file(
                 &compact_path,
                 &self.partitions_dir,
                 self.searchable_kinds.as_deref(),
@@ -620,7 +631,7 @@ impl HotEvents {
             info!(
                 path = %compact_path.display(),
                 hot_bytes,
-                output_partitions,
+                output_partitions = output.output_partitions,
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "recovered compacting hot events file"
             );
@@ -669,6 +680,58 @@ impl HotEvents {
             }
         }
         Ok(())
+    }
+
+    fn compact(&self) -> Result<CompactStats, Box<dyn Error>> {
+        if self
+            .compact_running
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::other("compaction is already running").into());
+        }
+
+        let result = (|| {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            let hot_bytes = state.file.metadata()?.len();
+            if hot_bytes == 0 {
+                return Ok(CompactStats::default());
+            }
+
+            let compact_path = self.rotate_hot_for_compaction(&mut state)?;
+            drop(state);
+
+            let context = CompactionContext {
+                path: self.path.clone(),
+                partitions_dir: self.partitions_dir.clone(),
+                max_bytes: self.max_bytes,
+                searchable_kinds: self.searchable_kinds.clone(),
+                visibility_store: self.visibility_store.clone(),
+                state: self.state.clone(),
+                sidecar_updates: self.sidecar_updates.clone(),
+                compact_running: self.compact_running.clone(),
+                compact_pending: self.compact_pending.clone(),
+                compacting_paths: self.compacting_paths.clone(),
+                compact_path,
+                hot_bytes,
+            };
+            run_one_compaction(&context)
+        })();
+
+        self.compact_running.store(false, AtomicOrdering::Release);
+        if self.compact_pending.swap(false, AtomicOrdering::AcqRel)
+            && self
+                .compact_running
+                .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_ok()
+        {
+            self.spawn_pending_compaction();
+        }
+
+        result
     }
 
     fn packet_matches_filter(&self, data: &[u8], filter: &Filter) -> Result<bool, Box<dyn Error>> {
@@ -741,6 +804,39 @@ impl HotEvents {
             std::thread::Builder::new()
                 .name("searchnos-compact".to_owned())
                 .spawn(move || run_compaction_queue(context))
+                .expect("spawn hot events compaction thread");
+        }
+    }
+
+    fn pending_compaction_context(&self) -> CompactionContext {
+        CompactionContext {
+            path: self.path.clone(),
+            partitions_dir: self.partitions_dir.clone(),
+            max_bytes: self.max_bytes,
+            searchable_kinds: self.searchable_kinds.clone(),
+            visibility_store: self.visibility_store.clone(),
+            state: self.state.clone(),
+            sidecar_updates: self.sidecar_updates.clone(),
+            compact_running: self.compact_running.clone(),
+            compact_pending: self.compact_pending.clone(),
+            compacting_paths: self.compacting_paths.clone(),
+            compact_path: PathBuf::new(),
+            hot_bytes: 0,
+        }
+    }
+
+    fn spawn_pending_compaction(&self) {
+        let context = self.pending_compaction_context();
+        #[cfg(test)]
+        {
+            run_pending_compaction_queue(context);
+        }
+
+        #[cfg(not(test))]
+        {
+            std::thread::Builder::new()
+                .name("searchnos-compact".to_owned())
+                .spawn(move || run_pending_compaction_queue(context))
                 .expect("spawn hot events compaction thread");
         }
     }
@@ -1196,9 +1292,46 @@ struct CompactionContext {
     hot_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompactOutput {
+    output_partitions: usize,
+    events: u64,
+}
+
+impl CompactOutput {
+    fn stats(self, bytes: u64) -> CompactStats {
+        CompactStats {
+            files: self.output_partitions as u64,
+            events: self.events,
+            bytes,
+        }
+    }
+}
+
+fn run_pending_compaction_queue(mut context: CompactionContext) {
+    match prepare_pending_compaction(&context) {
+        Ok(Some((compact_path, hot_bytes))) => {
+            context.compact_path = compact_path;
+            context.hot_bytes = hot_bytes;
+            run_compaction_queue(context);
+        }
+        Ok(None) => {
+            context
+                .compact_running
+                .store(false, AtomicOrdering::Release);
+        }
+        Err(err) => {
+            warn!(%err, "failed to prepare queued hot event compaction");
+            context
+                .compact_running
+                .store(false, AtomicOrdering::Release);
+        }
+    }
+}
+
 fn run_compaction_queue(mut context: CompactionContext) {
     loop {
-        run_one_compaction(&context);
+        let _ = run_one_compaction(&context);
 
         if !context.compact_pending.swap(false, AtomicOrdering::AcqRel) {
             context
@@ -1239,7 +1372,7 @@ fn run_compaction_queue(mut context: CompactionContext) {
     }
 }
 
-fn run_one_compaction(context: &CompactionContext) {
+fn run_one_compaction(context: &CompactionContext) -> Result<CompactStats, Box<dyn Error>> {
     let started_at = Instant::now();
     info!(
         path = %context.compact_path.display(),
@@ -1253,7 +1386,7 @@ fn run_one_compaction(context: &CompactionContext) {
         &context.visibility_store,
         &context.sidecar_updates,
     ) {
-        Ok(output_partitions) => {
+        Ok(output) => {
             if let Ok(mut paths) = context.compacting_paths.lock() {
                 paths.retain(|path| path != &context.compact_path);
             }
@@ -1266,10 +1399,11 @@ fn run_one_compaction(context: &CompactionContext) {
             }
             info!(
                 hot_bytes = context.hot_bytes,
-                output_partitions,
+                output_partitions = output.output_partitions,
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "compacted hot events"
             );
+            Ok(output.stats(context.hot_bytes))
         }
         Err(err) => {
             warn!(
@@ -1277,6 +1411,7 @@ fn run_one_compaction(context: &CompactionContext) {
                 %err,
                 "failed to compact hot events"
             );
+            Err(err)
         }
     }
 }
@@ -1332,8 +1467,9 @@ fn compact_hot_file(
     searchable_kinds: Option<&[u32]>,
     visibility_store: &VisibilityStore,
     sidecar_updates: &SidecarUpdateQueue,
-) -> Result<usize, Box<dyn Error>> {
+) -> Result<CompactOutput, Box<dyn Error>> {
     let hot_packets = read_event_packets_from_path(compact_path)?;
+    let events = hot_packets.len() as u64;
     let mut packets_by_day = BTreeMap::<u64, Vec<EventPacket>>::new();
     for packet in hot_packets {
         packets_by_day
@@ -1384,7 +1520,10 @@ fn compact_hot_file(
         }
         Ok::<(), Box<dyn Error>>(())
     })?;
-    Ok(output_partitions)
+    Ok(CompactOutput {
+        output_partitions,
+        events,
+    })
 }
 
 fn merge_packets_into_partition(

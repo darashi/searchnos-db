@@ -159,6 +159,29 @@ fn compact_writes_events_to_created_at_day_partitions() {
 }
 
 #[test]
+fn compact_can_be_requested_before_hot_reaches_size_limit() {
+    let dir = test_dir("manual-compact");
+    let hot_path = dir.join("hot.events");
+    let partitions_dir = dir.join("partitions");
+    let storage = Storage::open_at(&dir, 1000).unwrap();
+
+    let event = note("00", 10);
+    storage.append_packet(&event).unwrap();
+
+    let stats = storage.compact().unwrap();
+
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.events, 1);
+    assert_eq!(stats.bytes, packet(&event).len() as u64);
+    assert_eq!(fs::read(&hot_path).unwrap(), Vec::<u8>::new());
+    assert_eq!(
+        fs::read(partition_path(&partitions_dir, 0)).unwrap(),
+        packet(&event)
+    );
+    assert_eq!(storage.query(&[Filter::new()]).unwrap(), vec![event]);
+}
+
+#[test]
 fn partition_event_paths_orders_newest_first() {
     let dir = test_dir("partition-order");
     let partitions_dir = dir.join("partitions");

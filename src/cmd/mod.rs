@@ -2,10 +2,12 @@ use indicatif::{ProgressState, ProgressStyle};
 use searchnos_db::SearchnosDB;
 use std::fmt::Write;
 
+pub mod compact;
 pub mod dump;
 pub mod import;
 pub mod load;
 pub mod query;
+pub mod reindex;
 pub mod stat;
 
 mod error {
