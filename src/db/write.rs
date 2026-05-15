@@ -1,37 +1,33 @@
 use std::{
     cmp::Ordering,
     convert::TryInto,
-    str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use lmdb::{Cursor, RwTransaction, Transaction, WriteFlags};
 use lmdb_sys::MDB_LAST;
-use ndb::{Event as NdbEvent, NdbNote};
+use ndb::{NdbNote, NdbNoteBuf, TagElement};
 
-use crate::nostr::{
-    Event, EventId, JsonUtil, Kind, PublicKey, Signature, TagExt, TagKind, Tags, Timestamp,
-    extract_note_expiration,
-};
+use crate::nostr::{EventError, Kind, Timestamp, extract_note_expiration};
 
 use crate::ndb_ext::{
     note_deletion_ids, note_event_index_key, note_replacable_key, note_replace_deletion_hashes,
-    parse_a_tag, replace_deletion_hash_from_parts, to_ndb_note,
+    parse_a_tag, replace_deletion_hash_from_parts, tag_text, to_ndb_note_buf, verify_note,
 };
 
-use super::{
-    KEY_BYTES, SEQ_BYTES, SearchnosDB, SearchnosDBError,
-    normalize::{EventIndexData, build_event_index_key},
-};
+use super::{KEY_BYTES, SEQ_BYTES, SearchnosDB, SearchnosDBError, normalize::EventIndexData};
 
 #[derive(Debug)]
 pub struct PreparedInsert {
-    event: Event,
     index_data: EventIndexData,
-    deletion_ids: Vec<EventId>,
+    deletion_ids: Vec<[u8; 32]>,
     replace_deletions: Vec<ReplaceDeletionTarget>,
-    note_bytes: Vec<u8>,
+    note: NdbNoteBuf,
     expiration: Option<u64>,
+    id: [u8; 32],
+    pubkey: [u8; 32],
+    created_at: u64,
+    kind: u32,
 }
 
 /// Result of an event insertion attempt
@@ -80,64 +76,68 @@ impl SearchnosDB {
     }
 
     pub(crate) fn prepare_loaded_note_insert(
-        note_event: NdbEvent,
         note_bytes: Vec<u8>,
     ) -> Result<PreparedInsert, SearchnosDBError> {
-        Self::prepare_insert_with_note_bytes(
-            Self::event_from_ndb_event(note_event),
-            false,
-            note_bytes,
-        )
+        let note = NdbNoteBuf::from_bytes(note_bytes).map_err(SearchnosDBError::DecodeEvent)?;
+        Self::prepare_insert_with_note(note, false)
     }
 
     fn prepare_insert_with_options(
         raw: &str,
         reject_invalid_replace_deletions: bool,
     ) -> Result<PreparedInsert, SearchnosDBError> {
-        let event = Event::from_json(raw)?;
-        let note_bytes = to_ndb_note(raw)?;
-        Self::prepare_insert_with_note_bytes(event, reject_invalid_replace_deletions, note_bytes)
+        let note = to_ndb_note_buf(raw).map_err(Self::note_json_error_to_db_error)?;
+        Self::prepare_insert_with_note(note, reject_invalid_replace_deletions)
     }
 
-    fn prepare_insert_with_note_bytes(
-        event: Event,
+    fn note_json_error_to_db_error(err: ndb::Error) -> SearchnosDBError {
+        match err {
+            ndb::Error::Json(_)
+            | ndb::Error::MissingField(_)
+            | ndb::Error::InvalidJsonShape(_)
+            | ndb::Error::InvalidHex
+            | ndb::Error::InvalidUtf8 => {
+                SearchnosDBError::ParseEvent(EventError::InvalidJson(err.to_string()))
+            }
+            err => SearchnosDBError::EncodeEvent(err),
+        }
+    }
+
+    fn prepare_insert_with_note(
+        note: NdbNoteBuf,
         reject_invalid_replace_deletions: bool,
-        note_bytes: Vec<u8>,
     ) -> Result<PreparedInsert, SearchnosDBError> {
-        event.verify().map_err(SearchnosDBError::InvalidSignature)?;
-        let index_data = EventIndexData::from_event(&event);
+        let note_ref = note.as_ndb_note();
+        verify_note(&note_ref).map_err(SearchnosDBError::InvalidSignature)?;
+        let index_data =
+            EventIndexData::from_note(&note_ref).map_err(SearchnosDBError::DecodeEvent)?;
         let expiration = index_data.expiration;
-        let is_deletion = event.kind == Kind::EventDeletion;
+        let id = *note_ref.id();
+        let pubkey = *note_ref.pubkey();
+        let created_at = note_ref.created_at();
+        let kind = note_ref.kind();
+        let is_deletion = kind == Kind::EventDeletion.as_u32();
         let deletion_ids = if is_deletion {
-            Self::collect_deletion_ids(&event)
+            note_deletion_ids(&note_ref)
         } else {
             Vec::new()
         };
         let replace_deletions = if is_deletion {
-            Self::collect_replace_deletions(&event, reject_invalid_replace_deletions)?
+            Self::collect_note_replace_deletions(&note_ref, reject_invalid_replace_deletions)?
         } else {
             Vec::new()
         };
         Ok(PreparedInsert {
-            event,
             index_data,
             deletion_ids,
             replace_deletions,
-            note_bytes,
+            note,
             expiration,
+            id,
+            pubkey,
+            created_at,
+            kind,
         })
-    }
-
-    fn event_from_ndb_event(event: NdbEvent) -> Event {
-        Event {
-            id: EventId::from(event.id),
-            pubkey: PublicKey::from_bytes(event.pubkey),
-            created_at: Timestamp::from(event.created_at),
-            kind: Kind::from_u32(event.kind),
-            tags: Tags::new(event.tags),
-            content: event.content,
-            sig: Signature::from_bytes(event.sig),
-        }
     }
 
     pub(crate) fn is_expired(expiration: u64) -> bool {
@@ -165,23 +165,24 @@ impl SearchnosDB {
     ) -> Result<InsertResult, SearchnosDBError> {
         let current_time = Timestamp::now();
         if matches!(
-            self.validate_event_for_insertion(txn, &prepared.event, &prepared, current_time)?,
+            self.validate_event_for_insertion(txn, &prepared, current_time)?,
             ValidationResult::Skip
         ) {
             return Ok(InsertResult::Dropped);
         }
 
-        let existing_result = self.check_existing_event(txn, &prepared.event)?;
+        let existing_result = self.check_existing_event(txn, &prepared)?;
         let replacement_plan = match existing_result {
             ExistingEventResult::AlreadyExists(seq) => return Ok(InsertResult::AlreadyExists(seq)),
             ExistingEventResult::ShouldInsert { replacement } => replacement,
             ExistingEventResult::ShouldReplace { replacement } => Some(replacement),
         };
 
-        if prepared.event.kind.is_ephemeral() {
-            let note =
-                NdbNote::from_bytes(&prepared.note_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-            let event_json = prepared.event.as_json();
+        if Self::note_kind_is_ephemeral(prepared.kind) {
+            let note = prepared.note.as_ndb_note();
+            let event_json = note
+                .to_json_string()
+                .map_err(SearchnosDBError::DecodeEvent)?;
             self.broadcast_note(&note, &prepared.index_data.normalized_content, &event_json);
             return Ok(InsertResult::Dropped);
         }
@@ -197,13 +198,14 @@ impl SearchnosDB {
             }
         }
 
-        if prepared.event.kind == Kind::EventDeletion {
+        if prepared.kind == Kind::EventDeletion.as_u32() {
             self.handle_deletion_event(txn, &prepared, seq)?;
         }
 
-        let note =
-            NdbNote::from_bytes(&prepared.note_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-        let event_json = prepared.event.as_json();
+        let note = prepared.note.as_ndb_note();
+        let event_json = note
+            .to_json_string()
+            .map_err(SearchnosDBError::DecodeEvent)?;
         self.broadcast_note(&note, &prepared.index_data.normalized_content, &event_json);
 
         Ok(InsertResult::Inserted(seq))
@@ -212,19 +214,19 @@ impl SearchnosDB {
     fn validate_event_for_insertion(
         &self,
         _txn: &lmdb::RwTransaction,
-        event: &Event,
         prepared: &PreparedInsert,
         current_time: Timestamp,
     ) -> Result<ValidationResult, SearchnosDBError> {
         if let Some(expiration_ts) = prepared.expiration
-            && !event.kind.is_ephemeral()
+            && !Self::note_kind_is_ephemeral(prepared.kind)
             && expiration_ts <= current_time.as_u64()
         {
             return Ok(ValidationResult::Skip);
         }
 
         if let Some(policy) = &self.purge_policy
-            && policy.should_purge_immediately(event.kind.as_u16())
+            && prepared.kind <= u16::MAX as u32
+            && policy.should_purge_immediately(prepared.kind as u16)
         {
             return Ok(ValidationResult::Skip);
         }
@@ -235,13 +237,13 @@ impl SearchnosDB {
     fn check_existing_event<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
-        event: &Event,
+        prepared: &PreparedInsert,
     ) -> Result<ExistingEventResult, SearchnosDBError> {
-        let event_index_key = build_event_index_key(event);
-        let is_deletion = event.kind == Kind::EventDeletion;
+        let event_index_key = &prepared.index_data.event_index_key;
+        let is_deletion = prepared.kind == Kind::EventDeletion.as_u32();
 
         if !is_deletion {
-            let deletion_key = Self::deletion_marker_key(&event.id, &event.pubkey);
+            let deletion_key = Self::deletion_marker_key_bytes(&prepared.id, &prepared.pubkey);
             if let Some(existing_seq) = self.deletions.get_marker(txn, &deletion_key)? {
                 return Ok(ExistingEventResult::AlreadyExists(existing_seq));
             }
@@ -251,15 +253,16 @@ impl SearchnosDB {
             return Ok(ExistingEventResult::AlreadyExists(existing_seq));
         }
 
-        let Some(slot_key) = Self::replacable_key(event) else {
+        let note = prepared.note.as_ndb_note();
+        let Some(slot_key) = note_replacable_key(&note) else {
             return Ok(ExistingEventResult::ShouldInsert { replacement: None });
         };
 
-        if event.kind.is_addressable()
-            && let Some(hash) = Self::replace_deletion_hash_for_event(event)
+        if Self::note_kind_is_addressable(prepared.kind)
+            && let Some(hash) = Self::replace_deletion_hash_for_note(&note)
             && let Some(deletion_seq) =
                 self.replace_deletions
-                    .get_blocking_seq(txn, &hash, event.created_at.as_u64())?
+                    .get_blocking_seq(txn, &hash, prepared.created_at)?
         {
             return Ok(ExistingEventResult::AlreadyExists(deletion_seq));
         }
@@ -291,11 +294,11 @@ impl SearchnosDB {
         let existing_note =
             NdbNote::from_bytes(existing_bytes).map_err(SearchnosDBError::DecodeEvent)?;
         let existing_created = existing_note.created_at();
-        let this_created = event.created_at.as_u64();
+        let this_created = prepared.created_at;
 
         let new_wins = this_created > existing_created
             || (this_created == existing_created
-                && event.id.as_bytes().cmp(existing_note.id()) == Ordering::Less);
+                && prepared.id.as_slice().cmp(existing_note.id()) == Ordering::Less);
 
         if new_wins {
             return Ok(ExistingEventResult::ShouldReplace {
@@ -315,7 +318,7 @@ impl SearchnosDB {
         prepared: &PreparedInsert,
     ) -> Result<u64, SearchnosDBError> {
         let seq = self.next_seq(txn)?;
-        self.insert_event_data(txn, seq, &prepared.note_bytes, &prepared.index_data)?;
+        self.insert_event_data(txn, seq, prepared.note.as_bytes(), &prepared.index_data)?;
         self.update_indexes(txn, seq, &prepared.index_data, prepared.expiration)?;
         Ok(seq)
     }
@@ -365,13 +368,8 @@ impl SearchnosDB {
         prepared: &PreparedInsert,
         seq: u64,
     ) -> Result<(), SearchnosDBError> {
-        self.apply_deletions(txn, &prepared.event.pubkey, &prepared.deletion_ids, seq)?;
-        self.apply_replace_deletions(
-            txn,
-            &prepared.replace_deletions,
-            prepared.event.created_at.as_u64(),
-            seq,
-        )
+        self.apply_deletions(txn, &prepared.pubkey, &prepared.deletion_ids, seq)?;
+        self.apply_replace_deletions(txn, &prepared.replace_deletions, prepared.created_at, seq)
     }
 
     fn next_seq<'env>(&self, txn: &mut RwTransaction<'env>) -> Result<u64, SearchnosDBError> {
@@ -391,76 +389,69 @@ impl SearchnosDB {
         }
     }
 
-    fn first_d_tag_bytes(event: &Event) -> Option<Vec<u8>> {
-        for tag in event.tags.iter() {
-            let TagKind::SingleLetter(single) = tag.kind() else {
+    fn note_kind_is_ephemeral(kind: u32) -> bool {
+        kind <= u16::MAX as u32 && Kind::from_u16(kind as u16).is_ephemeral()
+    }
+
+    fn note_kind_is_addressable(kind: u32) -> bool {
+        kind <= u16::MAX as u32 && Kind::from_u16(kind as u16).is_addressable()
+    }
+
+    fn first_note_d_tag(note: &NdbNote<'_>) -> Option<String> {
+        for tag in note.tags() {
+            let Ok(tag) = tag else {
                 continue;
             };
-            if single != 'd' {
+            let mut elements = tag.elements();
+            let Some(Ok(identifier)) = elements.next() else {
+                continue;
+            };
+            if tag_text(identifier) != Some("d") {
                 continue;
             }
-            let value = tag.content().unwrap_or_default();
-            return Some(value.as_bytes().to_vec());
+            let Some(Ok(value)) = elements.next() else {
+                return Some(String::new());
+            };
+            return match value {
+                TagElement::Text(value) => Some(value.to_owned()),
+                TagElement::Id(_) => Some(String::new()),
+            };
         }
+
         None
     }
 
-    pub(crate) fn replacable_key(event: &Event) -> Option<Vec<u8>> {
-        let is_replaceable = event.kind.is_replaceable();
-        let is_addressable = event.kind.is_addressable();
-
-        if !is_replaceable && !is_addressable {
-            return None;
-        }
-
-        let slot = if is_addressable {
-            Self::first_d_tag_bytes(event).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let kind = event.kind.as_u16();
-        let mut key = Vec::with_capacity(event.pubkey.as_bytes().len() + 2 + 4 + slot.len());
-        key.extend_from_slice(event.pubkey.as_bytes());
-        key.extend_from_slice(&kind.to_be_bytes());
-        key.extend_from_slice(&(slot.len() as u32).to_be_bytes());
-        key.extend_from_slice(&slot);
-        Some(key)
-    }
-
-    pub(crate) fn collect_deletion_ids(event: &Event) -> Vec<EventId> {
-        let mut ids = Vec::new();
-        for tag in event.tags.iter() {
-            let TagKind::SingleLetter(single) = tag.kind() else {
-                continue;
-            };
-            if single != 'e' {
-                continue;
-            }
-            let Some(content) = tag.content() else {
-                continue;
-            };
-            let Ok(event_id) = EventId::from_str(content) else {
-                continue;
-            };
-            ids.push(event_id);
-        }
-        ids
-    }
-
-    fn collect_replace_deletions(
-        event: &Event,
+    fn collect_note_replace_deletions(
+        note: &NdbNote<'_>,
         reject_invalid: bool,
     ) -> Result<Vec<ReplaceDeletionTarget>, SearchnosDBError> {
         let mut targets = Vec::new();
-        for tag in event.tags.iter() {
-            let TagKind::SingleLetter(single) = tag.kind() else {
+        for tag in note.tags() {
+            let tag = tag.map_err(SearchnosDBError::DecodeEvent)?;
+            let mut elements = tag.elements();
+            let Some(identifier) = elements
+                .next()
+                .transpose()
+                .map_err(SearchnosDBError::DecodeEvent)?
+            else {
                 continue;
             };
-            if single != 'a' {
+            if tag_text(identifier) != Some("a") {
                 continue;
             }
-            let Some(a_tag) = tag.content() else {
+            let Some(value) = elements
+                .next()
+                .transpose()
+                .map_err(SearchnosDBError::DecodeEvent)?
+            else {
+                if !reject_invalid {
+                    continue;
+                }
+                return Err(SearchnosDBError::InvalidDeletionATag(
+                    "missing coordinate".to_string(),
+                ));
+            };
+            let Some(a_tag) = tag_text(value) else {
                 if !reject_invalid {
                     continue;
                 }
@@ -474,7 +465,7 @@ impl SearchnosDB {
                 }
                 return Err(SearchnosDBError::InvalidDeletionATag(a_tag.to_string()));
             };
-            if pubkey != *event.pubkey.as_bytes() {
+            if pubkey != *note.pubkey() {
                 if !reject_invalid {
                     continue;
                 }
@@ -489,23 +480,23 @@ impl SearchnosDB {
 
             targets.push(ReplaceDeletionTarget {
                 hash: replace_deletion_hash_from_parts(kind.as_u32(), &pubkey, d_tag),
-                slot_key: Self::replacable_key_from_parts(event.pubkey.as_bytes(), kind, d_tag),
+                slot_key: Self::replacable_key_from_parts(note.pubkey(), kind, d_tag),
             });
         }
 
         Ok(targets)
     }
 
-    fn replace_deletion_hash_for_event(event: &Event) -> Option<[u8; 32]> {
-        if !event.kind.is_addressable() {
+    fn replace_deletion_hash_for_note(note: &NdbNote<'_>) -> Option<[u8; 32]> {
+        if !Self::note_kind_is_addressable(note.kind()) {
             return None;
         }
 
-        let d_tag = Self::first_d_tag_bytes(event).unwrap_or_default();
+        let d_tag = Self::first_note_d_tag(note).unwrap_or_default();
         Some(replace_deletion_hash_from_parts(
-            event.kind.as_u32(),
-            event.pubkey.as_bytes(),
-            &String::from_utf8_lossy(&d_tag),
+            note.kind(),
+            note.pubkey(),
+            &d_tag,
         ))
     }
 
@@ -519,10 +510,6 @@ impl SearchnosDB {
         key
     }
 
-    fn deletion_marker_key(event_id: &EventId, pubkey: &PublicKey) -> Vec<u8> {
-        Self::deletion_marker_key_bytes(event_id.as_bytes(), pubkey.as_bytes())
-    }
-
     fn deletion_marker_key_bytes(event_id: &[u8; 32], pubkey: &[u8; 32]) -> Vec<u8> {
         let mut key = Vec::with_capacity(event_id.len() + pubkey.len());
         key.extend_from_slice(event_id);
@@ -533,8 +520,8 @@ impl SearchnosDB {
     fn apply_deletions<'env>(
         &self,
         txn: &mut RwTransaction<'env>,
-        pubkey: &PublicKey,
-        deletion_ids: &[EventId],
+        pubkey: &[u8; 32],
+        deletion_ids: &[[u8; 32]],
         deletion_seq: u64,
     ) -> Result<(), SearchnosDBError> {
         if deletion_ids.is_empty() {
@@ -542,11 +529,10 @@ impl SearchnosDB {
         }
 
         for event_id in deletion_ids {
-            let id_bytes = event_id.as_bytes();
-            let marker_key = Self::deletion_marker_key(event_id, pubkey);
+            let marker_key = Self::deletion_marker_key_bytes(event_id, pubkey);
             self.deletions.put_marker(txn, &marker_key, deletion_seq)?;
 
-            let id_refs: [&[u8]; 1] = [id_bytes];
+            let id_refs: [&[u8]; 1] = [event_id];
             let seqs: Vec<[u8; SEQ_BYTES]> = self
                 .event_id_index
                 .iter_candidates(txn, &id_refs)?
@@ -561,7 +547,7 @@ impl SearchnosDB {
                 };
                 let note =
                     NdbNote::from_bytes(event_bytes).map_err(SearchnosDBError::DecodeEvent)?;
-                if note.pubkey() != pubkey.as_bytes() {
+                if note.pubkey() != pubkey {
                     continue;
                 }
                 let removes_markers = note.kind() == Kind::EventDeletion.as_u32();

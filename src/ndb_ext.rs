@@ -1,7 +1,9 @@
 use ndb::{NdbNote, NdbNoteBuf, TagElement};
+use secp256k1::schnorr::Signature as SchnorrSignature;
+use secp256k1::{Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-use crate::nostr::Kind;
+use crate::nostr::{EventError, Kind};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NdbFilter {
@@ -80,12 +82,86 @@ impl Default for MatchEventOptions {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn to_ndb_note(json: &str) -> Result<Vec<u8>, ndb::Error> {
     Ok(NdbNoteBuf::from_json(json)?.into_bytes())
 }
 
+pub(crate) fn to_ndb_note_buf(json: &str) -> Result<NdbNoteBuf, ndb::Error> {
+    NdbNoteBuf::from_json(json)
+}
+
 pub(crate) fn from_ndb_note(bytes: &[u8]) -> Result<String, ndb::Error> {
     NdbNote::from_bytes(bytes)?.to_json_string()
+}
+
+pub(crate) fn verify_note(note: &NdbNote<'_>) -> Result<(), EventError> {
+    let expected_id = compute_note_id(note)?;
+    if note.id() != &expected_id {
+        return Err(EventError::InvalidId);
+    }
+
+    let secp = Secp256k1::verification_only();
+    let pubkey = XOnlyPublicKey::from_byte_array(*note.pubkey())
+        .map_err(|_| EventError::InvalidPublicKey)?;
+    let signature = SchnorrSignature::from_byte_array(*note.sig());
+
+    secp.verify_schnorr(&signature, &expected_id, &pubkey)
+        .map_err(|_| EventError::InvalidSignature)
+}
+
+fn compute_note_id(note: &NdbNote<'_>) -> Result<[u8; 32], EventError> {
+    let mut serialized = Vec::new();
+    serialized.push(b'[');
+    serialized.push(b'0');
+    serialized.push(b',');
+    write_json_string(&mut serialized, &hex::encode(note.pubkey()))?;
+    serialized.push(b',');
+    serialized.extend_from_slice(note.created_at().to_string().as_bytes());
+    serialized.push(b',');
+    serialized.extend_from_slice(note.kind().to_string().as_bytes());
+    serialized.push(b',');
+    serialized.push(b'[');
+
+    for (tag_index, tag) in note.tags().enumerate() {
+        let tag = tag.map_err(note_error_to_event_error)?;
+        if tag_index != 0 {
+            serialized.push(b',');
+        }
+        serialized.push(b'[');
+        for (elem_index, elem) in tag.elements().enumerate() {
+            let elem = elem.map_err(note_error_to_event_error)?;
+            if elem_index != 0 {
+                serialized.push(b',');
+            }
+            write_json_string(
+                &mut serialized,
+                &elem.to_json_string().map_err(note_error_to_event_error)?,
+            )?;
+        }
+        serialized.push(b']');
+    }
+
+    serialized.push(b']');
+    serialized.push(b',');
+    write_json_string(
+        &mut serialized,
+        note.content().map_err(note_error_to_event_error)?,
+    )?;
+    serialized.push(b']');
+
+    let hash = Sha256::digest(&serialized);
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&hash);
+    Ok(id)
+}
+
+fn write_json_string(out: &mut Vec<u8>, value: &str) -> Result<(), EventError> {
+    serde_json::to_writer(out, value).map_err(|err| EventError::InvalidJson(err.to_string()))
+}
+
+fn note_error_to_event_error(err: ndb::Error) -> EventError {
+    EventError::InvalidJson(err.to_string())
 }
 
 pub(crate) fn note_event_index_key(note: &NdbNote<'_>) -> Vec<u8> {

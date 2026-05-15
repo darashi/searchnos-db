@@ -1,9 +1,15 @@
 use std::collections::HashMap;
 
-use crate::nostr::{Event, Kind};
+use ndb::NdbNote;
+
+use crate::ndb_ext::tag_text;
+#[cfg(test)]
+use crate::nostr::Event;
+use crate::nostr::Kind;
 use unicode_normalization::UnicodeNormalization;
 
 /// Extract event text with kind-specific handling to support normalized content.
+#[cfg(test)]
 pub fn extract_text(event: &Event) -> String {
     match event.kind {
         Kind::Metadata => {
@@ -39,6 +45,46 @@ pub fn extract_text(event: &Event) -> String {
     }
 }
 
+/// Extract event text from an encoded note with kind-specific handling.
+pub(crate) fn extract_note_text(note: &NdbNote<'_>) -> Result<String, ndb::Error> {
+    match Kind::from_u32(note.kind()) {
+        Kind::Metadata => {
+            let content: HashMap<String, String> =
+                serde_json::from_str(note.content()?).unwrap_or_default();
+            Ok(content
+                .values()
+                .map(|value| value.to_owned())
+                .collect::<Vec<String>>()
+                .join(" "))
+        }
+        Kind::LongFormTextNote => {
+            let mut items = Vec::new();
+            items.push(note.content()?.to_owned());
+
+            for tag in note.tags() {
+                let tag = tag?;
+                let mut elements = tag.elements();
+                let Some(name) = elements.next().transpose()? else {
+                    continue;
+                };
+                let Some(value) = elements.next().transpose()? else {
+                    continue;
+                };
+                let Some(value) = tag_text(value) else {
+                    continue;
+                };
+
+                if let Some("title" | "Title" | "summary" | "Summary") = tag_text(name) {
+                    items.push(value.to_owned());
+                }
+            }
+
+            Ok(items.join(" "))
+        }
+        _ => Ok(note.content()?.to_owned()),
+    }
+}
+
 /// Normalize text by applying NFKC, lowercasing, and collapsing whitespace.
 pub fn normalize_text(input: &str) -> String {
     let nfkc: String = input.nfkc().collect();
@@ -67,6 +113,10 @@ pub fn normalize_query_terms(input: &str) -> Vec<String> {
         .split_whitespace()
         .map(|term| term.to_string())
         .collect()
+}
+
+pub(crate) fn normalize_note_content(note: &NdbNote<'_>) -> Result<String, ndb::Error> {
+    Ok(normalize_text(&extract_note_text(note)?))
 }
 
 #[cfg(test)]

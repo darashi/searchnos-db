@@ -3,7 +3,6 @@ use lmdb::{
 };
 
 use crate::nostr::{EventError, Filter};
-use ndb::NdbNote;
 use rayon::prelude::*;
 use serde_json::{Map, Value};
 use std::io::{ErrorKind, Read, Write};
@@ -492,9 +491,7 @@ impl SearchnosDB {
     fn prepare_loaded_dump_record(
         record: LoadedDumpRecord,
     ) -> Result<write::PreparedInsert, SearchnosDBError> {
-        let note = NdbNote::from_bytes(&record.payload).map_err(SearchnosDBError::DecodeEvent)?;
-        let note_event = note.to_event().map_err(SearchnosDBError::DecodeEvent)?;
-        Self::prepare_loaded_note_insert(note_event, record.payload)
+        Self::prepare_loaded_note_insert(record.payload)
     }
 
     fn is_load_record_error(err: &SearchnosDBError) -> bool {
