@@ -637,7 +637,7 @@ fn write_search_index_parts(
     Ok(())
 }
 
-fn tmp_search_index_path(path: &Path) -> PathBuf {
+pub(crate) fn tmp_search_index_path(path: &Path) -> PathBuf {
     let mut tmp_path = path.to_path_buf();
     let file_name = path
         .file_name()

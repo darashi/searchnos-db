@@ -38,7 +38,8 @@ use reindex::{ReindexJob, reindex_partition};
 use search::{
     SearchIndex, append_to_search_index, build_search_index, empty_search_index,
     read_event_packet_at, read_search_index_for_events, remove_file_if_exists,
-    search_bloom_may_match, search_index_path, search_sidecar_is_current, write_built_search_index,
+    search_bloom_may_match, search_index_path, search_sidecar_is_current, tmp_search_index_path,
+    write_built_search_index,
 };
 use visibility::{VisibilityIndex, VisibilityStore, VisibilitySummary, visibility_store_path};
 
@@ -1548,7 +1549,8 @@ fn merge_packets_into_partition(
     };
 
     let tmp_path = tmp_partition_path(partition_path);
-    let tmp_search_path = search_index_path(&tmp_path);
+    let search_path = search_index_path(partition_path);
+    let tmp_search_path = tmp_search_index_path(&search_path);
     let mut tmp_partition = OpenOptions::new()
         .create(true)
         .write(true)
@@ -1596,7 +1598,7 @@ fn merge_packets_into_partition(
     drop(tmp_partition);
     write_built_search_index(&tmp_search_path, &search_index)?;
     fs::rename(&tmp_path, partition_path)?;
-    fs::rename(&tmp_search_path, search_index_path(partition_path))?;
+    fs::rename(&tmp_search_path, search_path)?;
     visibility_store.merge_summary(&visibility_summary)?;
     Ok(())
 }
