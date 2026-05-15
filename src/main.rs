@@ -41,12 +41,6 @@ enum Command {
         /// Path to input JSONL file
         #[arg(value_name = "FILE", value_hint = ValueHint::FilePath, num_args = 1..)]
         import_paths: Vec<PathBuf>,
-        /// Maximum number of events per batch write
-        #[arg(long, default_value_t = 1024)]
-        batch_size: usize,
-        /// Flush interval in milliseconds
-        #[arg(long, default_value_t = 100)]
-        flush_interval_ms: u64,
     },
 }
 
@@ -69,13 +63,6 @@ fn run() -> Result<(), CliError> {
         Command::Dump { output_path } => cmd::dump::run(&db_path, &output_path),
         Command::Load { input_path } => cmd::load::run(&db_path, &input_path),
         Command::Query { filters } => cmd::query::run(&db_path, filters),
-        Command::Import {
-            import_paths,
-            batch_size,
-            flush_interval_ms,
-        } => {
-            let flush_interval = std::time::Duration::from_millis(flush_interval_ms);
-            cmd::import::run(&db_path, &import_paths, batch_size, flush_interval)
-        }
+        Command::Import { import_paths } => cmd::import::run(&db_path, &import_paths),
     }
 }

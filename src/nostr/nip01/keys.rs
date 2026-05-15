@@ -15,6 +15,10 @@ impl PublicKey {
         Self(bytes)
     }
 
+    pub fn from_byte_array(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

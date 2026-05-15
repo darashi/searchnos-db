@@ -1,4 +1,5 @@
 use indicatif::{ProgressState, ProgressStyle};
+use searchnos_db::SearchnosDB;
 use std::fmt::Write;
 
 pub mod dump;
@@ -8,32 +9,35 @@ pub mod query;
 pub mod stat;
 
 mod error {
-    use searchnos_db::SearchnosDBError;
     use thiserror::Error;
 
     #[derive(Debug, Error)]
     pub enum CliError {
         #[error(transparent)]
-        Db(#[from] SearchnosDBError),
-        #[error(transparent)]
         Io(#[from] std::io::Error),
+        #[error(transparent)]
+        Database(#[from] searchnos_db::SearchnosDBError),
+        #[error("failed to encode or decode ndb note: {0}")]
+        Ndb(#[from] ndb::Error),
         #[error("import failed in {path} at line {line}: {source}")]
         Import {
             path: String,
             line: usize,
             #[source]
-            source: SearchnosDBError,
+            source: Box<CliError>,
         },
         #[error("failed to parse filter JSON: {0}")]
         FilterJson(#[from] serde_json::Error),
-        #[error("filters must be a JSON object or array")]
-        InvalidFiltersFormat,
     }
 
     pub use CliError as Exported;
 }
 
 pub use error::Exported as CliError;
+
+pub(crate) fn open_database(db_path: &str) -> Result<SearchnosDB, CliError> {
+    Ok(SearchnosDB::open(db_path)?)
+}
 
 pub(crate) fn default_progress_style() -> ProgressStyle {
     ProgressStyle::with_template(
@@ -43,6 +47,14 @@ pub(crate) fn default_progress_style() -> ProgressStyle {
     .with_key("per_sec_ev", |state: &ProgressState, w: &mut dyn Write| {
         let _ = write!(w, "{:.2} ev/s", state.per_sec());
     })
+}
+
+pub(crate) fn event_stream_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {pos} events [{elapsed_precise}, {per_sec_ev}]")
+        .expect("progress style")
+        .with_key("per_sec_ev", |state: &ProgressState, w: &mut dyn Write| {
+            let _ = write!(w, "{:.2} ev/s", state.per_sec());
+        })
 }
 
 pub(crate) fn byte_progress_style() -> ProgressStyle {

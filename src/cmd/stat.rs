@@ -1,16 +1,10 @@
-use crate::cmd::CliError;
-use searchnos_db::{DatabaseStats, SearchnosDB};
+use crate::cmd::{CliError, open_database};
+use searchnos_db::DatabaseStats;
 
-/// Print LMDB statistics for the database at `db_path`.
+/// Print storage statistics for the database at `db_path`.
 pub fn run(db_path: &str) -> Result<(), CliError> {
-    let db = SearchnosDB::open(db_path)?;
+    let db = open_database(db_path)?;
     let stats = db.database_stats()?;
-
-    if stats.is_empty() {
-        println!("No databases found");
-        return Ok(());
-    }
-
     print_stats_table(&stats);
 
     Ok(())

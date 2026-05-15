@@ -1,18 +1,11 @@
-use crate::cmd::{CliError, default_progress_style};
+use crate::cmd::{CliError, default_progress_style, open_database};
 use indicatif::ProgressBar;
-use searchnos_db::{SearchnosDB, SearchnosDBOptions};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Import newline-delimited event JSON into a database with progress reporting.
-pub fn run(
-    db_path: &str,
-    import_paths: &[PathBuf],
-    batch_size: usize,
-    flush_interval: Duration,
-) -> Result<(), CliError> {
+pub fn run(db_path: &str, import_paths: &[PathBuf]) -> Result<(), CliError> {
     let mut total = 0usize;
     for path in import_paths {
         total += count_non_empty_lines(path)?;
@@ -21,13 +14,7 @@ pub fn run(
         return Ok(());
     }
 
-    let options = SearchnosDBOptions {
-        batch_size,
-        flush_interval,
-        purge_policy: None,
-        ..SearchnosDBOptions::default()
-    };
-    let db = SearchnosDB::open_with_options(db_path, options)?;
+    let db = open_database(db_path)?;
 
     let pb = ProgressBar::new(total as u64);
     pb.set_style(default_progress_style());
@@ -42,18 +29,16 @@ pub fn run(
                 continue;
             }
 
-            db.insert_event_json_owned(line)
+            db.insert_event_json(&line)
                 .map_err(|source| CliError::Import {
                     path: path.to_string_lossy().into_owned(),
                     line: idx + 1,
-                    source,
+                    source: Box::new(source.into()),
                 })?;
 
             pb.inc(1);
         }
     }
-
-    db.flush()?;
 
     pb.finish_with_message(format!("Imported {total} events into {db_path}"));
 

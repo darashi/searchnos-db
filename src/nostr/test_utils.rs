@@ -41,63 +41,6 @@ impl Metadata {
     }
 }
 
-impl Filter {
-    pub fn id(mut self, id: EventId) -> Self {
-        self.ids.get_or_insert_with(Vec::new).push(id);
-        self
-    }
-
-    pub fn author(mut self, author: PublicKey) -> Self {
-        self.authors.get_or_insert_with(Vec::new).push(author);
-        self
-    }
-
-    pub fn kind(mut self, kind: Kind) -> Self {
-        self.kinds.get_or_insert_with(Vec::new).push(kind);
-        self
-    }
-
-    pub fn since(mut self, ts: Timestamp) -> Self {
-        self.since = Some(ts);
-        self
-    }
-
-    pub fn until(mut self, ts: Timestamp) -> Self {
-        self.until = Some(ts);
-        self
-    }
-
-    pub fn limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    pub fn search(mut self, query: impl Into<String>) -> Self {
-        self.search = Some(query.into());
-        self
-    }
-
-    pub fn tag(mut self, tag: char, value: impl Into<String>) -> Self {
-        if !tag.is_ascii_alphabetic() {
-            return self;
-        }
-        let value = value.into();
-        if value.is_empty() {
-            return self;
-        }
-        if let Some((_, existing)) = self
-            .generic_tags
-            .iter_mut()
-            .find(|(existing_tag, _)| existing_tag == &tag)
-        {
-            existing.push(value);
-        } else {
-            self.generic_tags.push((tag, vec![value]));
-        }
-        self
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Keys {
     keypair: Keypair,
@@ -108,7 +51,8 @@ impl Keys {
     pub fn generate() -> Self {
         let secp = Secp256k1::new();
         let mut rng = rand::rng();
-        let keypair = Keypair::new(&secp, &mut rng);
+        let (secret_key, _) = secp.generate_keypair(&mut rng);
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
         let (xonly, _) = keypair.x_only_public_key();
         let public_key = PublicKey::from_bytes(xonly.serialize());
         Self {

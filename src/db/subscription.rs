@@ -4,15 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use crate::nostr::{Filter, extract_note_expiration};
 use futures_core::Stream;
-use ndb::NdbNote;
-use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use crate::db::SearchnosDB;
-use crate::ndb_ext::{MatchEventOptions, note_matches_filter};
-use crate::text::normalize_query_terms;
+use crate::nostr::Filter;
 
 pub(crate) const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 32_768;
 
@@ -85,21 +81,15 @@ impl SubscriptionManager {
         guard.retain(|entry| entry.id != id);
     }
 
-    pub(crate) fn collect_matching_senders<'note>(
+    pub(crate) fn collect_matching_senders(
         &self,
-        note: &NdbNote<'note>,
-        normalized_content: &[u8],
+        mut matches_filter: impl FnMut(&Filter) -> bool,
     ) -> Vec<(usize, Sender<StreamItem>)> {
         let guard = self.inner.entries.lock().expect("subscriptions poisoned");
         guard
             .iter()
             .filter(|entry| {
-                if entry.filters.is_empty() {
-                    return true;
-                }
-                entry.filters.iter().any(|filter| {
-                    SearchnosDB::filter_matches_note(filter, note, normalized_content)
-                })
+                entry.filters.is_empty() || entry.filters.iter().any(&mut matches_filter)
             })
             .map(|entry| (entry.id, entry.sender.clone()))
             .collect()
@@ -148,59 +138,5 @@ impl Stream for Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.manager.unregister(self.id);
-    }
-}
-
-impl SearchnosDB {
-    pub(crate) fn filter_matches_note(
-        filter: &Filter,
-        note: &NdbNote<'_>,
-        normalized_content: &[u8],
-    ) -> bool {
-        if filter
-            .search
-            .as_ref()
-            .is_some_and(|search| normalize_query_terms(search).is_empty())
-        {
-            return false;
-        }
-
-        let ndb_filter = Self::to_ndb_filter(filter, true);
-        let options = MatchEventOptions::new();
-        if !note_matches_filter(note, &ndb_filter, options, normalized_content) {
-            return false;
-        }
-
-        if let Some(expiration) = extract_note_expiration(note)
-            && !Self::note_is_ephemeral(note)
-            && Self::is_expired(expiration)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    pub(crate) fn broadcast_note(
-        &self,
-        note: &NdbNote<'_>,
-        normalized_content: &[u8],
-        event_json: &str,
-    ) {
-        let targets = self
-            .subscriptions
-            .collect_matching_senders(note, normalized_content);
-        if targets.is_empty() {
-            return;
-        }
-        let payload = event_json.to_owned();
-        for (id, sender) in targets {
-            let item = StreamItem::Event(payload.clone());
-            if let Err(err) = sender.try_send(item)
-                && matches!(err, TrySendError::Closed(_))
-            {
-                self.subscriptions.unregister(id);
-            }
-        }
     }
 }

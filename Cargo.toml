@@ -11,15 +11,14 @@ indicatif = "0.18.0"
 lmdb-sys = "0.8.0"
 clap = { version = "4.5.4", features = ["derive"] }
 unicode-normalization = "0.1.23"
-rayon = "1.10"
-futures-core = "0.3"
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-secp256k1 = { version = "0.31", features = ["rand", "serde"] }
 sha2 = "0.11"
-hex = "0.4"
 memchr = "2.8"
-
-[dev-dependencies]
-tempfile = "3.10"
+memmap2 = "0.9"
+tracing = "0.1"
+fs2 = "0.4"
+futures-core = "0.3"
+hex = "0.4"
+secp256k1 = { version = "0.31", features = ["rand"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }

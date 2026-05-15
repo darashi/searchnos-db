@@ -38,3 +38,15 @@ impl Kind {
         (30_000..40_000).contains(&self.0)
     }
 }
+
+impl From<u16> for Kind {
+    fn from(value: u16) -> Self {
+        Self::from_u16(value)
+    }
+}
+
+impl From<u32> for Kind {
+    fn from(value: u32) -> Self {
+        Self::from_u32(value)
+    }
+}

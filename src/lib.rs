@@ -1,6 +1,13 @@
-mod db;
+pub mod db;
 mod ndb_ext;
-pub mod nostr;
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::enum_variant_names,
+    clippy::wrong_self_convention
+)]
+mod nostr;
+mod storage;
 mod text;
 
 pub use db::{
@@ -8,4 +15,3 @@ pub use db::{
     QueryResult, QueryStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem,
     Subscription,
 };
-pub use ndb_ext::MatchEventOptions;

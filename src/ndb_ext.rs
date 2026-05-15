@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ndb::{NdbNote, NdbNoteBuf, TagElement};
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use secp256k1::{Secp256k1, XOnlyPublicKey};

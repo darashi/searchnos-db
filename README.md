@@ -1,147 +1,165 @@
 # searchnos-db
 
-searchnos-db is a local LMDB-backed database designed for storing and retrieving Nostr events. It keeps normalized event content for NIP-50 search, maintains the indexes needed for event identity, kind statistics, expiration, deletion markers, and replaceable events, and provides tools to automatically purge expired data. The crate can be used both as a CLI utility and as a library embedding the database in your own application.
+searchnos-db is a local Nostr event store and query tool. Its storage layer is implemented directly in this repository as an internal Rust module instead of being used as an external crate or path dependency.
 
-Events are serialized in a format that is (hopefully) compatible with `ndb_note` (v1) of [`nostrdb`](https://github.com/damus-io/nostrdb) when stored on disk.
-The overall layout takes cues from both [`strfry`](https://github.com/hoytech/strfry) and [`nostrdb`](https://github.com/damus-io/nostrdb).
-Text search is evaluated by scanning normalized event content.
+Events are stored as `ndb_note` payloads. Recent writes go to a hot append-only event file, and older data is compacted into per-day partition files with sidecar search and visibility indexes. Queries use NIP-01 filters plus NIP-50-style `search` terms.
+
+The crate can be used as both a CLI utility and a library.
 
 ## Highlights
-- **LMDB storage**: relies on a durable B+Tree datastore optimized for random access workloads.
-- **Focused indexing**: maintains indexes for event IDs, expiration timestamps, deletion markers, and replaceable-event slots.
-- **Text normalization**: normalizes Unicode text (NFKC), lowercases, and collapses whitespace to improve search quality.
-- **Expiration handling**: reads `expiration` tags and optional purge policies to drop stale events.
-- **Operational tooling**: ships with CLI subcommands for statistics, imports, dumps, and queries.
 
-> ⚠️ **Stability notice:** searchnos-db is under active development. Public interfaces may change without prior notice, and on-disk storage formats are not guaranteed to remain compatible between releases.
+- **Local storage layer**: stores event packets in `hot.events`, per-day partition files, search sidecars, and a visibility LMDB used by the storage layer.
+- **NIP-01 query support**: filters by ids, authors, kinds, time ranges, limits, and single-letter generic tags.
+- **NIP-50 search support**: normalizes searchable text and uses partition search sidecars when available.
+- **Deletion and replaceable visibility**: stores raw events append-only, while query visibility hides deleted events and superseded replaceable/addressable events.
+- **Dump/load tooling**: exports and imports raw `ndb_note` payloads using a simple length-prefixed binary stream.
+
+> Stability notice: searchnos-db is under active development. Public interfaces and on-disk storage formats may change without prior notice.
+
+## Storage Layout
+
+Given `--db-path ./data`, searchnos-db manages files under that directory:
+
+```text
+./data/
+  hot.events
+  partitions/
+    <unix-day>.events
+    <unix-day>.search
+  visibility/
+    data.mdb
+    lock.mdb
+```
+
+`hot.events` contains newly appended event packets. When the hot file exceeds the configured size, storage rotates and compacts it into per-day partition files under `partitions/`. The `.search` sidecars support search queries, and `visibility/` stores deletion and replaceable-event visibility metadata.
+
+The `.search` files are derived data that can be rebuilt from their matching `.events` files. Opening storage runs a non-forced reindex, which rebuilds missing, stale, or unreadable sidecars while leaving current sidecars intact. Search queries also repair a missing or unreadable partition sidecar on demand and use the rebuilt sidecar in the same query when repair succeeds. Reindexing writes rebuilt sidecars through a temporary file followed by an atomic rename.
+
+This repository contains the storage source directly under `src/storage/`. Keep storage changes local to that module unless the project intentionally moves back to an external crate.
+
+## Current Scope
+
+Included:
+
+- Event append and query through the local storage layer.
+- Search sidecar creation during compaction.
+- Reindex implementation inside `src/storage`.
+- Storage-level negentropy item collection: `(created_at, event_id)` values for a Unix day.
+
+Not currently implemented by the CLI:
+
+- Relay negentropy reconciliation loop.
+- CLI flags such as `--negentropy-relay` or `--negentropy-days`.
+- Automatic purge policy behavior from the older LMDB-backed implementation.
 
 ## Getting Started
-```bash
-# Build the project and download dependencies
-cargo build
 
-# Create the default data directory used by the CLI
+```bash
+cargo build
 mkdir -p data
 ```
 
-You can adjust LMDB settings such as map size through `SearchnosDBOptions`. Every CLI subcommand accepts `--db-path` to target an alternate directory (default: `./data`).
+Every CLI subcommand accepts `--db-path` to target an alternate storage directory. The default is `./data`.
 
 ## CLI Usage
-All commands can be run through `cargo run --`. Omitting `--db-path` falls back to `./data`.
+
+All commands can be run through `cargo run --`.
 
 ### Help
+
 ```bash
 cargo run -- --help
 ```
 
 ### Show statistics
+
 ```bash
-cargo run -- stat --db-path ./data
+cargo run -- --db-path ./data stat
 ```
-Prints a table with entry counts and total key/value bytes for each LMDB database.
+
+Prints the number of currently query-visible events and the total bytes of their `ndb_note` payloads. This is not an LMDB page-level report.
 
 ### Import events
+
 ```bash
-cargo run -- import ./events-a.jsonl ./events-b.jsonl --db-path ./data
+cargo run -- --db-path ./data import ./events-a.jsonl ./events-b.jsonl
 ```
-Reads newline-delimited JSON and inserts events with a progress bar. Multiple files are processed sequentially, and blank lines are skipped.
+
+Reads newline-delimited event JSON and appends valid events with a progress bar. Multiple files are processed sequentially, and blank lines are skipped.
 
 ### Dump events
+
 ```bash
-cargo run -- dump ./events.dump --db-path ./data
+cargo run -- --db-path ./data dump ./events.dump
 ```
-Writes all stored `ndb_note` payloads to a binary dump file with a progress bar. The dump format is a repeated sequence of:
+
+Writes query-visible `ndb_note` payloads to a binary dump file with a progress bar. The dump format is a repeated sequence of:
 
 1. 4-byte unsigned payload length encoded as big-endian `u32`
 2. Raw `ndb_note` payload bytes of that length
 
 ### Load events
+
 ```bash
-cargo run -- load ./events.dump --db-path ./data
+cargo run -- --db-path ./data load ./events.dump
 ```
-Reads the binary dump format produced by `dump` and inserts each event through the normal write path. Existing duplicate, deletion, expiration, and replaceable-event rules still apply.
+
+Reads the binary dump format produced by `dump`, verifies each event, and appends valid payloads to storage. Invalid records are skipped with a warning.
 
 ### Query events
+
 ```bash
-cargo run -- query '{"authors": ["<hex pubkey>"], "kinds": [1]}'
+cargo run -- --db-path ./data query '{"authors": ["<hex-pubkey>"], "kinds": [1]}'
 ```
-Provide a JSON object for one filter or a JSON array for multiple filters. The `search` field follows NIP-50 semantics. Matching events are printed as JSON on stdout, and execution time is logged to stderr.
+
+Provide a JSON object for one filter or a JSON array for multiple filters. Matching events are printed as JSON on stdout, and execution timing is logged to stderr.
 
 ## Library Usage
-The crate exposes the `SearchnosDB` type for embedding in other Rust applications.
 
-```rust
-use searchnos_db::{SearchnosDB, SearchnosDBOptions};
-
-let options = SearchnosDBOptions::default();
-let db = SearchnosDB::open_with_options("./data", options)?;
-
-let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":[],"created_at":0,"sig":"..."}"#;
-db.insert_event_json(raw_event)?;
-
-db.flush()?; // ensure pending batches are written
-```
-
-### Dump and load from Rust
-Use `dump_events` or `load_events` when the caller only needs the serialized stream, and the `_with_progress` variants when the caller wants to report progress. The crate reads from any `std::io::Read` and writes to any `std::io::Write`, so file creation, compression, or network transport can remain the caller's responsibility.
-
-```rust
-use searchnos_db::{DumpProgress, LoadProgress, SearchnosDB};
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-
-let db = SearchnosDB::open("./data")?;
-let file = File::create("./events.dump")?;
-let writer = BufWriter::new(file);
-
-db.dump_events_with_progress(writer, |progress: DumpProgress| {
-    eprintln!(
-        "dumped {}/{} events ({} bytes)",
-        progress.events_written,
-        progress.total_events,
-        progress.bytes_written,
-    );
-})?;
-
-let file = File::open("./events.dump")?;
-let reader = BufReader::new(file);
-
-db.load_events_with_progress(reader, |progress: LoadProgress| {
-    eprintln!(
-        "loaded {} events ({} bytes read)",
-        progress.events_loaded,
-        progress.bytes_read,
-    );
-})?;
-```
-
-### Streaming initial query results only
-Use `stream_query` when a caller only needs the initial matching events and does not want live updates. It delivers events in the same order as `query` without materializing the full `Vec<String>`.
+The crate exposes `SearchnosDB` as the high-level API. It accepts event JSON,
+verifies events before inserting them, returns query results as event JSON, and
+provides dump/load helpers.
 
 ```rust
 use searchnos_db::SearchnosDB;
 
 let db = SearchnosDB::open("./data")?;
-let filters = r#"[{"kinds":[1],"limit":100}]"#;
 
-db.stream_query(filters, |event_json| {
-    // Process event_json here.
+let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":[],"created_at":0,"sig":"..."}"#;
+db.insert_event_json(raw_event)?;
+```
+
+### Query from Rust
+
+```rust
+use searchnos_db::SearchnosDB;
+
+let db = SearchnosDB::open("./data")?;
+let events = db.query(r#"{"limit":100}"#)?;
+```
+
+Use `stream_query` when the caller wants to process matching events without materializing the full result vector:
+
+```rust
+db.stream_query(r#"{"limit":100}"#, |event_json| {
+    // Process event JSON here.
     true
 })?;
 ```
 
-Return `false` from the callback to stop delivery early, for example when the client disconnects or the outbound queue is full. Use `stream_query_with_stats` when the caller also needs query timing details.
-
-Refer to the Rustdoc comments for details on purge policies, index behavior, and the embedded `ndb` format helpers.
+Return `false` from the callback to stop delivery early.
 
 ## Development Workflow
+
 Run the following checks before sending changes:
+
 ```bash
 cargo fmt
 cargo check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy
 cargo test
 ```
 
 ## License
+
 See [`LICENSE`](./LICENSE).
