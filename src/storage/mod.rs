@@ -57,6 +57,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const COMPACTION_SORT_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(test)]
 const COMPACTION_SORT_CHUNK_BYTES: u64 = 128;
+const COMPACTION_VISIBILITY_FLUSH_EVENTS: u64 = 10_000;
 
 pub const DEFAULT_HOT_MAX_BYTES: u64 = 1024 * 1024;
 pub type NegentropyItem = (u64, [u8; 32]);
@@ -1684,6 +1685,7 @@ fn merge_sorted_chunks_into_partition(
 
     let mut search_index = SearchIndexWriter::create(&tmp_search_path, searchable_kinds)?;
     let mut visibility_summary = VisibilitySummary::default();
+    let mut visibility_events = 0;
     loop {
         let new_index = best_sorted_file_index(&mut new_packets)?;
         let new_packet = new_index
@@ -1703,6 +1705,8 @@ fn merge_sorted_chunks_into_partition(
                 &mut tmp_partition,
                 &mut search_index,
                 &mut visibility_summary,
+                &mut visibility_events,
+                visibility_store,
                 &packet,
                 searchable_kinds,
             )?;
@@ -1712,6 +1716,8 @@ fn merge_sorted_chunks_into_partition(
                 &mut tmp_partition,
                 &mut search_index,
                 &mut visibility_summary,
+                &mut visibility_events,
+                visibility_store,
                 &packet,
                 searchable_kinds,
             )?;
@@ -1729,7 +1735,11 @@ fn merge_sorted_chunks_into_partition(
     search_index.finish()?;
     fs::rename(&tmp_path, partition_path)?;
     fs::rename(&tmp_search_path, search_index_path(partition_path))?;
-    visibility_store.merge_summary(&visibility_summary)?;
+    flush_visibility_summary(
+        visibility_store,
+        &mut visibility_summary,
+        &mut visibility_events,
+    )?;
     Ok(())
 }
 
@@ -1786,12 +1796,32 @@ fn write_merged_packet(
     partition: &mut File,
     search_index: &mut SearchIndexWriter,
     visibility_summary: &mut VisibilitySummary,
+    visibility_events: &mut u64,
+    visibility_store: &VisibilityStore,
     packet: &EventPacket,
     searchable_kinds: Option<&[u32]>,
 ) -> Result<(), Box<dyn Error>> {
     write_packet(partition, &packet.data)?;
     search_index.append(&packet.data, searchable_kinds)?;
     visibility_summary.add_packet(packet)?;
+    *visibility_events += 1;
+    if *visibility_events >= COMPACTION_VISIBILITY_FLUSH_EVENTS {
+        flush_visibility_summary(visibility_store, visibility_summary, visibility_events)?;
+    }
+    Ok(())
+}
+
+fn flush_visibility_summary(
+    visibility_store: &VisibilityStore,
+    visibility_summary: &mut VisibilitySummary,
+    visibility_events: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    if *visibility_events == 0 {
+        return Ok(());
+    }
+    visibility_store.merge_summary(visibility_summary)?;
+    *visibility_summary = VisibilitySummary::default();
+    *visibility_events = 0;
     Ok(())
 }
 
