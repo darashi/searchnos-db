@@ -36,9 +36,9 @@ use query::{
 };
 use reindex::{ReindexJob, reindex_partition};
 use search::{
-    SearchIndex, SearchIndexWriter, append_to_search_index, build_search_index, empty_search_index,
+    SearchIndex, append_to_search_index, build_search_index, empty_search_index,
     read_event_packet_at, read_search_index_for_events, remove_file_if_exists,
-    search_bloom_may_match, search_index_path, search_sidecar_is_current,
+    search_bloom_may_match, search_index_path, search_sidecar_is_current, write_built_search_index,
 };
 use visibility::{VisibilityIndex, VisibilityStore, VisibilitySummary, visibility_store_path};
 
@@ -53,11 +53,6 @@ const LONG_FORM_KIND: u32 = 30_023;
 const SEARCH_INDEX_MAGIC: &[u8; 8] = b"SRCHSI01";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-#[cfg(not(test))]
-const COMPACTION_SORT_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
-#[cfg(test)]
-const COMPACTION_SORT_CHUNK_BYTES: u64 = 128;
-const COMPACTION_VISIBILITY_FLUSH_EVENTS: u64 = 10_000;
 
 pub const DEFAULT_HOT_MAX_BYTES: u64 = 1024 * 1024;
 pub type NegentropyItem = (u64, [u8; 32]);
@@ -1473,27 +1468,38 @@ fn compact_hot_file(
     visibility_store: &VisibilityStore,
     sidecar_updates: &SidecarUpdateQueue,
 ) -> Result<CompactOutput, Box<dyn Error>> {
-    let spools = spool_compaction_by_day(compact_path, partitions_dir)?;
-    let events = spools.values().map(|spool| spool.events).sum();
-    let output_partitions = spools.len();
+    let hot_packets = read_event_packets_from_path(compact_path)?;
+    let events = hot_packets.len() as u64;
+    let mut packets_by_day = BTreeMap::<u64, Vec<EventPacket>>::new();
+    for packet in hot_packets {
+        packets_by_day
+            .entry(packet.unix_day())
+            .or_default()
+            .push(packet);
+    }
+
+    let output_partitions = packets_by_day.len();
     let _sidecar_updates = sidecar_updates.acquire_compaction()?;
-    let jobs = Mutex::new(spools.into_iter());
+    let jobs = Mutex::new(packets_by_day.into_iter());
     thread::scope(|scope| {
-        let worker_count = compaction_worker_count(output_partitions);
+        let worker_count = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(output_partitions);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let jobs = &jobs;
             handles.push(scope.spawn(move || {
                 loop {
-                    let Some((unix_day, spool)) =
+                    let Some((unix_day, packets)) =
                         jobs.lock().map_err(|err| err.to_string())?.next()
                     else {
                         return Ok::<(), String>(());
                     };
                     let partition_path = partition_path(partitions_dir, unix_day);
-                    merge_spooled_packets_into_partition(
+                    merge_packets_into_partition(
                         &partition_path,
-                        spool,
+                        packets,
                         searchable_kinds,
                         visibility_store,
                     )
@@ -1520,149 +1526,15 @@ fn compact_hot_file(
     })
 }
 
-fn compaction_worker_count(output_partitions: usize) -> usize {
-    thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(output_partitions)
-}
-
-struct DaySpool {
-    path: PathBuf,
-    file: File,
-    events: u64,
-}
-
-fn spool_compaction_by_day(
-    compact_path: &Path,
-    partitions_dir: &Path,
-) -> Result<BTreeMap<u64, DaySpool>, Box<dyn Error>> {
-    let mut compact_file = File::open(compact_path)
-        .map_err(|err| error_with_path("open events", compact_path, err))?;
-    let mut spools = BTreeMap::<u64, DaySpool>::new();
-    while let Some(packet) = read_event_packet(&mut compact_file)
-        .map_err(|err| error_with_path("read events", compact_path, err))?
-    {
-        let unix_day = packet.unix_day();
-        let spool = match spools.entry(unix_day) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let path = compact_spool_path(partitions_dir, compact_path, unix_day);
-                remove_file_if_exists(&path)?;
-                let file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&path)
-                    .map_err(|err| error_with_path("create compaction spool", &path, err))?;
-                entry.insert(DaySpool {
-                    path,
-                    file,
-                    events: 0,
-                })
-            }
-        };
-        write_packet(&mut spool.file, &packet.data)
-            .map_err(|err| error_with_path("write compaction spool", &spool.path, err))?;
-        spool.events += 1;
-    }
-    for spool in spools.values_mut() {
-        spool
-            .file
-            .sync_all()
-            .map_err(|err| error_with_path("sync compaction spool", &spool.path, err))?;
-    }
-    Ok(spools)
-}
-
-fn compact_spool_path(partitions_dir: &Path, compact_path: &Path, unix_day: u64) -> PathBuf {
-    let compact_name = compact_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("hot.events.compacting");
-    partitions_dir.join(format!("{compact_name}.{unix_day}.spool"))
-}
-
-fn compact_chunk_path(spool_path: &Path, chunk_index: usize) -> PathBuf {
-    let mut file_name = spool_path
-        .file_name()
-        .expect("spool path has a file name")
-        .to_os_string();
-    file_name.push(format!(".chunk-{chunk_index}"));
-    spool_path.with_file_name(file_name)
-}
-
-fn merge_spooled_packets_into_partition(
+fn merge_packets_into_partition(
     partition_path: &Path,
-    spool: DaySpool,
+    new_packets: Vec<EventPacket>,
     searchable_kinds: Option<&[u32]>,
     visibility_store: &VisibilityStore,
 ) -> Result<(), Box<dyn Error>> {
-    spool.file.sync_all()?;
-    let spool_path = spool.path;
-    drop(spool.file);
-    let chunk_paths = sort_spool_into_chunks(&spool_path)?;
-    let result = merge_sorted_chunks_into_partition(
-        partition_path,
-        &chunk_paths,
-        searchable_kinds,
-        visibility_store,
-    );
-    for chunk_path in chunk_paths {
-        remove_file_if_exists(chunk_path)?;
-    }
-    remove_file_if_exists(&spool_path)?;
-    result
-}
-
-fn sort_spool_into_chunks(spool_path: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let mut spool_file = File::open(spool_path)
-        .map_err(|err| error_with_path("open compaction spool", spool_path, err))?;
-    let mut chunk_paths = Vec::new();
-    loop {
-        let mut packets = Vec::new();
-        let mut bytes = 0;
-        while bytes < COMPACTION_SORT_CHUNK_BYTES {
-            let Some(packet) = read_event_packet(&mut spool_file)
-                .map_err(|err| error_with_path("read compaction spool", spool_path, err))?
-            else {
-                break;
-            };
-            bytes += packet.data.len() as u64 + size_of::<u32>() as u64;
-            packets.push(packet);
-        }
-        if packets.is_empty() {
-            break;
-        }
-        packets.sort_by(compare_packets);
-        let chunk_path = compact_chunk_path(spool_path, chunk_paths.len());
-        remove_file_if_exists(&chunk_path)?;
-        let mut chunk_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&chunk_path)
-            .map_err(|err| error_with_path("create compaction chunk", &chunk_path, err))?;
-        for packet in &packets {
-            write_packet(&mut chunk_file, &packet.data)
-                .map_err(|err| error_with_path("write compaction chunk", &chunk_path, err))?;
-        }
-        chunk_file
-            .sync_all()
-            .map_err(|err| error_with_path("sync compaction chunk", &chunk_path, err))?;
-        chunk_paths.push(chunk_path);
-    }
-    Ok(chunk_paths)
-}
-
-fn merge_sorted_chunks_into_partition(
-    partition_path: &Path,
-    chunk_paths: &[PathBuf],
-    searchable_kinds: Option<&[u32]>,
-    visibility_store: &VisibilityStore,
-) -> Result<(), Box<dyn Error>> {
-    let mut new_packets = Vec::with_capacity(chunk_paths.len());
-    for path in chunk_paths {
-        new_packets.push(SortedPacketFile::open(path)?);
-    }
+    let mut new_packets = new_packets;
+    new_packets.sort_by(compare_packets);
+    let mut new_packets = new_packets.into_iter().peekable();
 
     let mut existing_partition = match File::open(partition_path) {
         Ok(file) => Some(file),
@@ -1683,15 +1555,10 @@ fn merge_sorted_chunks_into_partition(
         .truncate(true)
         .open(&tmp_path)?;
 
-    let mut search_index = SearchIndexWriter::create(&tmp_search_path, searchable_kinds)?;
+    let mut search_index = empty_search_index(searchable_kinds);
     let mut visibility_summary = VisibilitySummary::default();
-    let mut visibility_events = 0;
     loop {
-        let new_index = best_sorted_file_index(&mut new_packets)?;
-        let new_packet = new_index
-            .and_then(|index| new_packets[index].peek().transpose())
-            .transpose()?;
-        let take_new = match (existing_packet.as_ref(), new_packet.as_ref()) {
+        let take_new = match (existing_packet.as_ref(), new_packets.peek()) {
             (Some(existing), Some(new)) => compare_packets(existing, new).is_gt(),
             (Some(_), None) => false,
             (None, Some(_)) => true,
@@ -1699,14 +1566,11 @@ fn merge_sorted_chunks_into_partition(
         };
 
         if take_new {
-            let index = new_index.expect("new packet is present");
-            let packet = new_packets[index].pop()?.expect("new packet is present");
+            let packet = new_packets.next().expect("new packet is present");
             write_merged_packet(
                 &mut tmp_partition,
                 &mut search_index,
                 &mut visibility_summary,
-                &mut visibility_events,
-                visibility_store,
                 &packet,
                 searchable_kinds,
             )?;
@@ -1716,8 +1580,6 @@ fn merge_sorted_chunks_into_partition(
                 &mut tmp_partition,
                 &mut search_index,
                 &mut visibility_summary,
-                &mut visibility_events,
-                visibility_store,
                 &packet,
                 searchable_kinds,
             )?;
@@ -1732,96 +1594,23 @@ fn merge_sorted_chunks_into_partition(
 
     tmp_partition.sync_all()?;
     drop(tmp_partition);
-    search_index.finish()?;
+    write_built_search_index(&tmp_search_path, &search_index)?;
     fs::rename(&tmp_path, partition_path)?;
     fs::rename(&tmp_search_path, search_index_path(partition_path))?;
-    flush_visibility_summary(
-        visibility_store,
-        &mut visibility_summary,
-        &mut visibility_events,
-    )?;
+    visibility_store.merge_summary(&visibility_summary)?;
     Ok(())
-}
-
-struct SortedPacketFile {
-    path: PathBuf,
-    file: File,
-    pending: Option<EventPacket>,
-}
-
-impl SortedPacketFile {
-    fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let file =
-            File::open(path).map_err(|err| error_with_path("open compaction chunk", path, err))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-            pending: None,
-        })
-    }
-
-    fn peek(&mut self) -> Result<Option<&EventPacket>, Box<dyn Error>> {
-        if self.pending.is_none() {
-            self.pending = read_event_packet(&mut self.file)
-                .map_err(|err| error_with_path("read compaction chunk", &self.path, err))?;
-        }
-        Ok(self.pending.as_ref())
-    }
-
-    fn pop(&mut self) -> Result<Option<EventPacket>, Box<dyn Error>> {
-        if self.pending.is_some() {
-            return Ok(self.pending.take());
-        }
-        read_event_packet(&mut self.file)
-            .map_err(|err| error_with_path("read compaction chunk", &self.path, err))
-    }
-}
-
-fn best_sorted_file_index(files: &mut [SortedPacketFile]) -> Result<Option<usize>, Box<dyn Error>> {
-    let mut best: Option<usize> = None;
-    for index in 0..files.len() {
-        let Some(packet) = files[index].peek()?.cloned() else {
-            continue;
-        };
-        if best.is_none_or(|best_index| {
-            compare_packets(&packet, files[best_index].pending.as_ref().unwrap()).is_lt()
-        }) {
-            best = Some(index);
-        }
-    }
-    Ok(best)
 }
 
 fn write_merged_packet(
     partition: &mut File,
-    search_index: &mut SearchIndexWriter,
+    search_index: &mut SearchIndex,
     visibility_summary: &mut VisibilitySummary,
-    visibility_events: &mut u64,
-    visibility_store: &VisibilityStore,
     packet: &EventPacket,
     searchable_kinds: Option<&[u32]>,
 ) -> Result<(), Box<dyn Error>> {
     write_packet(partition, &packet.data)?;
-    search_index.append(&packet.data, searchable_kinds)?;
+    append_to_search_index(search_index, &packet.data, searchable_kinds)?;
     visibility_summary.add_packet(packet)?;
-    *visibility_events += 1;
-    if *visibility_events >= COMPACTION_VISIBILITY_FLUSH_EVENTS {
-        flush_visibility_summary(visibility_store, visibility_summary, visibility_events)?;
-    }
-    Ok(())
-}
-
-fn flush_visibility_summary(
-    visibility_store: &VisibilityStore,
-    visibility_summary: &mut VisibilitySummary,
-    visibility_events: &mut u64,
-) -> Result<(), Box<dyn Error>> {
-    if *visibility_events == 0 {
-        return Ok(());
-    }
-    visibility_store.merge_summary(visibility_summary)?;
-    *visibility_summary = VisibilitySummary::default();
-    *visibility_events = 0;
     Ok(())
 }
 
