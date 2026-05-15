@@ -36,9 +36,9 @@ use query::{
 };
 use reindex::{ReindexJob, reindex_partition};
 use search::{
-    SearchIndex, append_to_search_index, build_search_index, empty_search_index,
+    SearchIndex, SearchIndexWriter, append_to_search_index, build_search_index, empty_search_index,
     read_event_packet_at, read_search_index_for_events, remove_file_if_exists,
-    search_bloom_may_match, search_index_path, search_sidecar_is_current, write_built_search_index,
+    search_bloom_may_match, search_index_path, search_sidecar_is_current,
 };
 use visibility::{VisibilityIndex, VisibilityStore, VisibilitySummary, visibility_store_path};
 
@@ -1682,7 +1682,7 @@ fn merge_sorted_chunks_into_partition(
         .truncate(true)
         .open(&tmp_path)?;
 
-    let mut search_index = empty_search_index(searchable_kinds);
+    let mut search_index = SearchIndexWriter::create(&tmp_search_path, searchable_kinds)?;
     let mut visibility_summary = VisibilitySummary::default();
     loop {
         let new_index = best_sorted_file_index(&mut new_packets)?;
@@ -1726,7 +1726,7 @@ fn merge_sorted_chunks_into_partition(
 
     tmp_partition.sync_all()?;
     drop(tmp_partition);
-    write_built_search_index(&tmp_search_path, &search_index)?;
+    search_index.finish()?;
     fs::rename(&tmp_path, partition_path)?;
     fs::rename(&tmp_search_path, search_index_path(partition_path))?;
     visibility_store.merge_summary(&visibility_summary)?;
@@ -1784,13 +1784,13 @@ fn best_sorted_file_index(files: &mut [SortedPacketFile]) -> Result<Option<usize
 
 fn write_merged_packet(
     partition: &mut File,
-    search_index: &mut SearchIndex,
+    search_index: &mut SearchIndexWriter,
     visibility_summary: &mut VisibilitySummary,
     packet: &EventPacket,
     searchable_kinds: Option<&[u32]>,
 ) -> Result<(), Box<dyn Error>> {
     write_packet(partition, &packet.data)?;
-    append_to_search_index(search_index, &packet.data, searchable_kinds)?;
+    search_index.append(&packet.data, searchable_kinds)?;
     visibility_summary.add_packet(packet)?;
     Ok(())
 }

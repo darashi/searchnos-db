@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write, copy};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -354,6 +354,164 @@ pub(crate) fn write_built_search_index(
         index.bloom.as_slice(),
         index.text.as_slice(),
     )
+}
+
+pub(crate) struct SearchIndexWriter {
+    path: PathBuf,
+    records_path: PathBuf,
+    offsets_path: PathBuf,
+    text_path: PathBuf,
+    records_file: File,
+    offsets_file: File,
+    text_file: File,
+    fingerprint: EventsFingerprint,
+    searchable_kinds_hash: u64,
+    bloom: Vec<u8>,
+    text_bytes: u64,
+}
+
+impl SearchIndexWriter {
+    pub(crate) fn create(
+        path: &Path,
+        searchable_kinds: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let records_path = search_index_part_path(path, "records");
+        let offsets_path = search_index_part_path(path, "offsets");
+        let text_path = search_index_part_path(path, "text");
+        remove_file_if_exists(&records_path)?;
+        remove_file_if_exists(&offsets_path)?;
+        remove_file_if_exists(&text_path)?;
+        let records_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&records_path)?;
+        let mut offsets_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&offsets_path)?;
+        offsets_file.write_all(&0u64.to_le_bytes())?;
+        let text_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&text_path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            records_path,
+            offsets_path,
+            text_path,
+            records_file,
+            offsets_file,
+            text_file,
+            fingerprint: EventsFingerprint {
+                count: 0,
+                bytes: 0,
+                hash: FNV_OFFSET_BASIS,
+            },
+            searchable_kinds_hash: text::searchable_kinds_hash(searchable_kinds),
+            bloom: vec![0; SEARCH_BLOOM_BYTES],
+            text_bytes: 0,
+        })
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        data: &[u8],
+        searchable_kinds: Option<&[u32]>,
+    ) -> Result<(), Box<dyn Error>> {
+        let text = text::normalized_search_text(data, searchable_kinds)?;
+        self.records_file
+            .write_all(&self.fingerprint.bytes.to_le_bytes())?;
+        let packet_len = u32::try_from(data.len())?;
+        self.records_file.write_all(&packet_len.to_le_bytes())?;
+        for gram in search_bloom_text_grams(&text) {
+            insert_bloom_gram(&mut self.bloom, gram.as_bytes());
+        }
+        self.text_file.write_all(&text)?;
+        self.text_bytes += text.len() as u64;
+        self.offsets_file
+            .write_all(&self.text_bytes.to_le_bytes())?;
+        self.fingerprint.count += 1;
+        self.fingerprint.bytes += size_of::<u32>() as u64 + data.len() as u64;
+        update_hash(&mut self.fingerprint.hash, &packet_len.to_le_bytes());
+        update_hash(&mut self.fingerprint.hash, data);
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(), Box<dyn Error>> {
+        self.records_file.sync_all()?;
+        self.offsets_file.sync_all()?;
+        self.text_file.sync_all()?;
+        let path = self.path;
+        let records_path = self.records_path;
+        let offsets_path = self.offsets_path;
+        let text_path = self.text_path;
+        let fingerprint = self.fingerprint;
+        let searchable_kinds_hash = self.searchable_kinds_hash;
+        let bloom = self.bloom;
+        drop(self.records_file);
+        drop(self.offsets_file);
+        drop(self.text_file);
+
+        let result = write_streamed_search_index(
+            &path,
+            fingerprint,
+            searchable_kinds_hash,
+            &records_path,
+            &offsets_path,
+            &bloom,
+            &text_path,
+        );
+        let cleanup = cleanup_search_index_parts(&records_path, &offsets_path, &text_path);
+        result?;
+        cleanup?;
+        Ok(())
+    }
+}
+
+fn cleanup_search_index_parts(
+    records_path: &Path,
+    offsets_path: &Path,
+    text_path: &Path,
+) -> io::Result<()> {
+    remove_file_if_exists(records_path)?;
+    remove_file_if_exists(offsets_path)?;
+    remove_file_if_exists(text_path)
+}
+
+fn write_streamed_search_index(
+    path: &Path,
+    fingerprint: EventsFingerprint,
+    searchable_kinds_hash: u64,
+    records_path: &Path,
+    offsets_path: &Path,
+    bloom: &[u8],
+    text_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(SEARCH_INDEX_MAGIC)?;
+    file.write_all(&fingerprint.count.to_le_bytes())?;
+    file.write_all(&fingerprint.bytes.to_le_bytes())?;
+    file.write_all(&fingerprint.hash.to_le_bytes())?;
+    file.write_all(&searchable_kinds_hash.to_le_bytes())?;
+    copy(&mut File::open(records_path)?, &mut file)?;
+    copy(&mut File::open(offsets_path)?, &mut file)?;
+    file.write_all(bloom)?;
+    copy(&mut File::open(text_path)?, &mut file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn search_index_part_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "search".into());
+    file_name.push(format!(".{suffix}"));
+    path.with_file_name(file_name)
 }
 
 pub(crate) fn read_search_index_for_events(
