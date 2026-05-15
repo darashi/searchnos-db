@@ -14,6 +14,7 @@ mod query;
 mod reindex;
 mod search;
 mod sidecar_queue;
+mod streaming_query;
 mod text;
 mod visibility;
 use event::EventPacket;
