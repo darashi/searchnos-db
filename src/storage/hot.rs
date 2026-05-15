@@ -1,0 +1,815 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use tracing::{info, warn};
+
+use crate::nostr::Filter;
+
+use super::compaction::{
+    CompactionContext, compact_hot_file, rotate_hot_for_compaction, run_compaction_queue,
+    run_one_compaction, run_pending_compaction_queue,
+};
+use super::cursor::{PacketCursor, best_day_cursor_index};
+use super::event::{
+    EventPacket, error_with_path, read_event_packets, read_event_packets_from_path,
+};
+use super::partition::{orphaned_compacting_hot_paths, partition_event_paths, partition_path};
+use super::query::{
+    filter_has_search_terms, partition_days, query_packets_with_index,
+    retain_visible_packets_if_needed, sort_packets,
+};
+use super::reindex::{ReindexJob, reindex_partition};
+use super::search::{
+    SearchIndex, append_to_search_index, build_search_index, remove_file_if_exists,
+    search_bloom_may_match, search_index_path, search_sidecar_is_current,
+};
+use super::sidecar_queue::SidecarUpdateQueue;
+use super::text;
+use super::visibility::{VisibilityIndex, VisibilityStore, visibility_store_path};
+use super::{CompactStats, NegentropyItem, ReindexProgress, ReindexProgressPhase, ReindexStats};
+
+const DEFAULT_STORAGE_DIR: &str = "data";
+const HOT_EVENTS_FILE: &str = "hot.events";
+const STORAGE_LOCK_FILE: &str = "storage.lock";
+const PARTITIONS_DIR: &str = "partitions";
+
+pub(crate) struct HotEvents {
+    path: PathBuf,
+    partitions_dir: PathBuf,
+    _lock_file: File,
+    max_bytes: u64,
+    searchable_kinds: Option<Vec<u32>>,
+    visibility_store: Arc<VisibilityStore>,
+    state: Arc<Mutex<HotState>>,
+    sidecar_updates: Arc<SidecarUpdateQueue>,
+    compact_running: Arc<AtomicBool>,
+    compact_pending: Arc<AtomicBool>,
+    compacting_paths: Arc<Mutex<Vec<PathBuf>>>,
+    deferred_compaction_last_log_unix: AtomicU64,
+}
+
+pub(crate) struct HotState {
+    pub(crate) file: File,
+    pub(crate) hot_search_index: SearchIndex,
+}
+
+struct StreamingFilterState<'a> {
+    filter: &'a Filter,
+    remaining: Option<usize>,
+    has_search_terms: bool,
+    visibility: Option<VisibilityIndex>,
+    hot_by_day: BTreeMap<u64, Vec<EventPacket>>,
+    partition_days: BTreeSet<u64>,
+    missing_search_sidecars: u64,
+    invalid_search_sidecars: u64,
+    rebuilt_search_sidecars: u64,
+    bloom_skipped_partitions: u64,
+    searched_partitions: u64,
+}
+
+impl HotEvents {
+    pub(crate) fn open(
+        max_bytes: u64,
+        searchable_kinds: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open_at_with_searchable_kinds(DEFAULT_STORAGE_DIR, max_bytes, searchable_kinds)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_at(
+        storage_dir: impl Into<PathBuf>,
+        max_bytes: u64,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::open_at_with_searchable_kinds(storage_dir, max_bytes, None)
+    }
+
+    pub(crate) fn open_at_with_searchable_kinds(
+        storage_dir: impl Into<PathBuf>,
+        max_bytes: u64,
+        searchable_kinds: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let storage_dir = storage_dir.into();
+        let path = storage_dir.join(HOT_EVENTS_FILE);
+        let partitions_dir = storage_dir.join(PARTITIONS_DIR);
+        let searchable_kinds = text::normalize_searchable_kinds(searchable_kinds);
+
+        fs::create_dir_all(&storage_dir)?;
+        let lock_file = acquire_storage_lock(&storage_dir)?;
+        fs::create_dir_all(&partitions_dir)?;
+        let visibility_store = Arc::new(VisibilityStore::open(visibility_store_path(
+            &partitions_dir,
+        ))?);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let hot_packets = read_event_packets(&mut file)
+            .map_err(|err| error_with_path("read events", &path, err))?;
+        let hot_search_index = build_search_index(&hot_packets, searchable_kinds.as_deref())
+            .map_err(|err| error_with_path("build search index for events", &path, err))?;
+        file.seek(SeekFrom::End(0))?;
+        remove_file_if_exists(search_index_path(&path))?;
+
+        let hot_events = Self {
+            path,
+            partitions_dir,
+            _lock_file: lock_file,
+            max_bytes,
+            searchable_kinds,
+            visibility_store,
+            state: Arc::new(Mutex::new(HotState {
+                file,
+                hot_search_index,
+            })),
+            sidecar_updates: Arc::new(SidecarUpdateQueue::new()),
+            compact_running: Arc::new(AtomicBool::new(false)),
+            compact_pending: Arc::new(AtomicBool::new(false)),
+            compacting_paths: Arc::new(Mutex::new(Vec::new())),
+            deferred_compaction_last_log_unix: AtomicU64::new(0),
+        };
+        hot_events.recover_compacting_hot_files()?;
+        hot_events.reindex(false, |_| {})?;
+        Ok(hot_events)
+    }
+
+    fn recover_compacting_hot_files(&self) -> Result<(), Box<dyn Error>> {
+        let compacting_paths = orphaned_compacting_hot_paths(&self.path)?;
+        for compact_path in compacting_paths {
+            let started_at = Instant::now();
+            let hot_bytes = fs::metadata(&compact_path)?.len();
+            info!(
+                path = %compact_path.display(),
+                hot_bytes,
+                "recovering compacting hot events file"
+            );
+            let output = compact_hot_file(
+                &compact_path,
+                &self.partitions_dir,
+                self.searchable_kinds.as_deref(),
+                &self.visibility_store,
+                &self.sidecar_updates,
+            )?;
+            fs::remove_file(&compact_path).map_err(|err| {
+                error_with_path("remove recovered compacting hot events", &compact_path, err)
+            })?;
+            info!(
+                path = %compact_path.display(),
+                hot_bytes,
+                output_partitions = output.output_partitions,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "recovered compacting hot events file"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_packet(&self, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let len = u32::try_from(data.len())?;
+        let mut packet = Vec::with_capacity(size_of::<u32>() + data.len());
+        packet.extend_from_slice(&len.to_le_bytes());
+        packet.extend_from_slice(data);
+
+        state.file.write_all(&packet)?;
+        append_to_search_index(
+            &mut state.hot_search_index,
+            data,
+            self.searchable_kinds.as_deref(),
+        )?;
+        let hot_bytes = state.file.metadata()?.len();
+        if hot_bytes > self.max_bytes {
+            if self
+                .compact_running
+                .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_ok()
+            {
+                match self.rotate_hot_for_compaction(&mut state) {
+                    Ok(compact_path) => self.spawn_compaction(compact_path, hot_bytes),
+                    Err(err) => {
+                        self.compact_running.store(false, AtomicOrdering::Release);
+                        return Err(err);
+                    }
+                }
+            } else {
+                self.compact_pending.store(true, AtomicOrdering::Release);
+                if self.should_log_deferred_compaction() {
+                    info!(
+                        hot_bytes,
+                        "queued hot event compaction while another compaction is running"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compact(&self) -> Result<CompactStats, Box<dyn Error>> {
+        if self
+            .compact_running
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::other("compaction is already running").into());
+        }
+
+        let result = (|| {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|err| io::Error::other(err.to_string()))?;
+            let hot_bytes = state.file.metadata()?.len();
+            if hot_bytes == 0 {
+                return Ok(CompactStats::default());
+            }
+
+            let compact_path = self.rotate_hot_for_compaction(&mut state)?;
+            drop(state);
+
+            let context = CompactionContext {
+                path: self.path.clone(),
+                partitions_dir: self.partitions_dir.clone(),
+                max_bytes: self.max_bytes,
+                searchable_kinds: self.searchable_kinds.clone(),
+                visibility_store: self.visibility_store.clone(),
+                state: self.state.clone(),
+                sidecar_updates: self.sidecar_updates.clone(),
+                compact_running: self.compact_running.clone(),
+                compact_pending: self.compact_pending.clone(),
+                compacting_paths: self.compacting_paths.clone(),
+                compact_path,
+                hot_bytes,
+            };
+            run_one_compaction(&context)
+        })();
+
+        self.compact_running.store(false, AtomicOrdering::Release);
+        if self.compact_pending.swap(false, AtomicOrdering::AcqRel)
+            && self
+                .compact_running
+                .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_ok()
+        {
+            self.spawn_pending_compaction();
+        }
+
+        result
+    }
+
+    pub(crate) fn packet_matches_filter(
+        &self,
+        data: &[u8],
+        filter: &Filter,
+    ) -> Result<bool, Box<dyn Error>> {
+        EventPacket::from_data(data.to_vec())?
+            .matches_filter(filter, self.searchable_kinds.as_deref())
+    }
+
+    fn should_log_deferred_compaction(&self) -> bool {
+        const DEFERRED_COMPACTION_LOG_INTERVAL_SECS: u64 = 10;
+
+        let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return false;
+        };
+        let now = elapsed.as_secs();
+        let last = self
+            .deferred_compaction_last_log_unix
+            .load(AtomicOrdering::Acquire);
+        if now.saturating_sub(last) < DEFERRED_COMPACTION_LOG_INTERVAL_SECS {
+            return false;
+        }
+        self.deferred_compaction_last_log_unix
+            .compare_exchange(last, now, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+    }
+
+    fn rotate_hot_for_compaction(&self, state: &mut HotState) -> Result<PathBuf, Box<dyn Error>> {
+        rotate_hot_for_compaction(
+            &self.path,
+            self.searchable_kinds.as_deref(),
+            &self.compacting_paths,
+            state,
+        )
+    }
+
+    fn spawn_compaction(&self, compact_path: PathBuf, hot_bytes: u64) {
+        #[cfg(test)]
+        {
+            run_compaction_queue(CompactionContext {
+                path: self.path.clone(),
+                partitions_dir: self.partitions_dir.clone(),
+                max_bytes: self.max_bytes,
+                searchable_kinds: self.searchable_kinds.clone(),
+                visibility_store: self.visibility_store.clone(),
+                state: self.state.clone(),
+                sidecar_updates: self.sidecar_updates.clone(),
+                compact_running: self.compact_running.clone(),
+                compact_pending: self.compact_pending.clone(),
+                compacting_paths: self.compacting_paths.clone(),
+                compact_path,
+                hot_bytes,
+            });
+        }
+
+        #[cfg(not(test))]
+        {
+            let context = CompactionContext {
+                path: self.path.clone(),
+                partitions_dir: self.partitions_dir.clone(),
+                max_bytes: self.max_bytes,
+                searchable_kinds: self.searchable_kinds.clone(),
+                visibility_store: self.visibility_store.clone(),
+                state: self.state.clone(),
+                sidecar_updates: self.sidecar_updates.clone(),
+                compact_running: self.compact_running.clone(),
+                compact_pending: self.compact_pending.clone(),
+                compacting_paths: self.compacting_paths.clone(),
+                compact_path,
+                hot_bytes,
+            };
+            std::thread::Builder::new()
+                .name("searchnos-compact".to_owned())
+                .spawn(move || run_compaction_queue(context))
+                .expect("spawn hot events compaction thread");
+        }
+    }
+
+    fn pending_compaction_context(&self) -> CompactionContext {
+        CompactionContext {
+            path: self.path.clone(),
+            partitions_dir: self.partitions_dir.clone(),
+            max_bytes: self.max_bytes,
+            searchable_kinds: self.searchable_kinds.clone(),
+            visibility_store: self.visibility_store.clone(),
+            state: self.state.clone(),
+            sidecar_updates: self.sidecar_updates.clone(),
+            compact_running: self.compact_running.clone(),
+            compact_pending: self.compact_pending.clone(),
+            compacting_paths: self.compacting_paths.clone(),
+            compact_path: PathBuf::new(),
+            hot_bytes: 0,
+        }
+    }
+
+    fn spawn_pending_compaction(&self) {
+        let context = self.pending_compaction_context();
+        #[cfg(test)]
+        {
+            run_pending_compaction_queue(context);
+        }
+
+        #[cfg(not(test))]
+        {
+            std::thread::Builder::new()
+                .name("searchnos-compact".to_owned())
+                .spawn(move || run_pending_compaction_queue(context))
+                .expect("spawn hot events compaction thread");
+        }
+    }
+
+    fn compacting_paths_snapshot(&self) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        Ok(self
+            .compacting_paths
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .clone())
+    }
+
+    fn read_compacting_packets(&self) -> Result<Vec<EventPacket>, Box<dyn Error>> {
+        let mut packets = Vec::new();
+        for path in self.compacting_paths_snapshot()? {
+            packets.extend(read_event_packets_from_path(&path)?);
+        }
+        Ok(packets)
+    }
+
+    pub(crate) fn query_streaming(
+        &self,
+        filters: &[Filter],
+        mut emit: impl FnMut(EventPacket) -> Result<(), Box<dyn Error>>,
+    ) -> Result<(), Box<dyn Error>> {
+        let started_at = Instant::now();
+        let (hot_packets, hot_search_index) = self.hot_snapshot()?;
+        let mut states = Vec::with_capacity(filters.len());
+        let mut days = BTreeSet::new();
+
+        for filter in filters {
+            let mut hot_matches =
+                query_packets_with_index(hot_packets.clone(), Some(&hot_search_index), filter)?;
+            let has_search_terms = filter_has_search_terms(filter);
+            let visibility = if has_search_terms {
+                Some(VisibilityIndex::from_packets(&hot_packets)?)
+            } else {
+                None
+            };
+            retain_visible_packets_if_needed(&mut hot_matches, visibility.as_ref(), None)?;
+
+            let mut hot_by_day: BTreeMap<u64, Vec<EventPacket>> = BTreeMap::new();
+            for packet in hot_matches {
+                hot_by_day
+                    .entry(packet.unix_day())
+                    .or_default()
+                    .push(packet);
+            }
+            days.extend(hot_by_day.keys().copied());
+
+            let partition_days = partition_days(&self.partitions_dir, filter)?;
+            days.extend(partition_days.iter().copied());
+
+            states.push(StreamingFilterState {
+                filter,
+                remaining: filter.limit,
+                has_search_terms,
+                visibility,
+                hot_by_day,
+                partition_days: partition_days.into_iter().collect(),
+                missing_search_sidecars: 0,
+                invalid_search_sidecars: 0,
+                rebuilt_search_sidecars: 0,
+                bloom_skipped_partitions: 0,
+                searched_partitions: 0,
+            });
+        }
+
+        let mut emitted = BTreeSet::new();
+        for unix_day in days.into_iter().rev() {
+            let mut day_cursors = Vec::new();
+
+            for (state_index, state) in states.iter_mut().enumerate() {
+                if state.remaining == Some(0) {
+                    continue;
+                }
+
+                let mut filter_cursors = Vec::new();
+                if let Some(mut hot_packets) = state.hot_by_day.remove(&unix_day) {
+                    sort_packets(&mut hot_packets);
+                    if let Some(cursor) = PacketCursor::buffered(hot_packets) {
+                        filter_cursors.push(cursor);
+                    }
+                }
+
+                if state.partition_days.contains(&unix_day) {
+                    let partition_path = partition_path(&self.partitions_dir, unix_day);
+                    let mut query_partition = true;
+                    if state.has_search_terms {
+                        let search_path = search_index_path(&partition_path);
+                        if !search_path.exists() {
+                            state.missing_search_sidecars += 1;
+                            match self.rebuild_partition_sidecars(&partition_path) {
+                                Ok(events) => {
+                                    state.rebuilt_search_sidecars += 1;
+                                    info!(
+                                        path = %partition_path.display(),
+                                        events,
+                                        "rebuilt missing search sidecar during query"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        path = %partition_path.display(),
+                                        error = %err,
+                                        "skipped partition after failing to rebuild missing search sidecar"
+                                    );
+                                    query_partition = false;
+                                }
+                            }
+                        }
+
+                        if query_partition {
+                            match search_bloom_may_match(
+                                &partition_path,
+                                state.filter,
+                                self.searchable_kinds.as_deref(),
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    state.bloom_skipped_partitions += 1;
+                                    query_partition = false;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        path = %search_path.display(),
+                                        error = %err,
+                                        "rebuilding unreadable search sidecar during query"
+                                    );
+                                    state.invalid_search_sidecars += 1;
+                                    remove_file_if_exists(&search_path).map_err(|err| {
+                                        error_with_path("remove search index", &search_path, err)
+                                    })?;
+                                    match self.rebuild_partition_sidecars(&partition_path) {
+                                        Ok(events) => {
+                                            state.rebuilt_search_sidecars += 1;
+                                            info!(
+                                                path = %partition_path.display(),
+                                                events,
+                                                "rebuilt unreadable search sidecar during query"
+                                            );
+                                            match search_bloom_may_match(
+                                                &partition_path,
+                                                state.filter,
+                                                self.searchable_kinds.as_deref(),
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    state.bloom_skipped_partitions += 1;
+                                                    query_partition = false;
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        path = %search_path.display(),
+                                                        error = %err,
+                                                        "skipped partition after rebuilt search sidecar remained unreadable"
+                                                    );
+                                                    query_partition = false;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                path = %partition_path.display(),
+                                                error = %err,
+                                                "skipped partition after failing to rebuild unreadable search sidecar"
+                                            );
+                                            query_partition = false;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            debug_assert!(!query_partition);
+                        }
+                    }
+
+                    if query_partition {
+                        if state.has_search_terms {
+                            state.searched_partitions += 1;
+                        }
+                        let partition_cursor = match PacketCursor::partition(
+                            &partition_path,
+                            state.filter,
+                            self.searchable_kinds.as_deref(),
+                            state.visibility.as_ref(),
+                            Some(self.visibility_store.clone()),
+                        ) {
+                            Ok(cursor) => cursor,
+                            Err(err) if state.has_search_terms => {
+                                let search_path = search_index_path(&partition_path);
+                                warn!(
+                                    path = %partition_path.display(),
+                                    error = %err,
+                                    "rebuilding unreadable search index during partition scan"
+                                );
+                                remove_file_if_exists(&search_path).map_err(|err| {
+                                    error_with_path("remove search index", &search_path, err)
+                                })?;
+                                state.invalid_search_sidecars += 1;
+                                match self.rebuild_partition_sidecars(&partition_path) {
+                                    Ok(events) => {
+                                        state.rebuilt_search_sidecars += 1;
+                                        info!(
+                                            path = %partition_path.display(),
+                                            events,
+                                            "rebuilt unreadable search index during partition scan"
+                                        );
+                                        PacketCursor::partition(
+                                            &partition_path,
+                                            state.filter,
+                                            self.searchable_kinds.as_deref(),
+                                            state.visibility.as_ref(),
+                                            Some(self.visibility_store.clone()),
+                                        )
+                                        .unwrap_or_else(|err| {
+                                            warn!(
+                                                path = %partition_path.display(),
+                                                error = %err,
+                                                "skipped partition after rebuilt search index remained unreadable"
+                                            );
+                                            None
+                                        })
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            path = %partition_path.display(),
+                                            error = %err,
+                                            "skipped partition after failing to rebuild unreadable search index"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if let Some(cursor) = partition_cursor {
+                            filter_cursors.push(cursor);
+                        }
+                    }
+                }
+
+                if let Some(cursor) = PacketCursor::merged(filter_cursors, state.remaining) {
+                    day_cursors.push((state_index, cursor));
+                }
+            }
+
+            while let Some(cursor_index) = best_day_cursor_index(&mut day_cursors)? {
+                let state_index = day_cursors[cursor_index].0;
+                let packet = day_cursors[cursor_index]
+                    .1
+                    .pop()?
+                    .expect("cursor selected from non-empty peek");
+                if let Some(remaining) = &mut states[state_index].remaining {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                if !emitted.insert(packet.id) {
+                    continue;
+                }
+                emit(packet)?;
+            }
+        }
+
+        for state in states {
+            if state.has_search_terms {
+                let inaccessible_search_sidecars =
+                    state.missing_search_sidecars + state.invalid_search_sidecars;
+                info!(
+                    searched_partitions = state.searched_partitions,
+                    bloom_skipped_partitions = state.bloom_skipped_partitions,
+                    inaccessible_search_sidecars,
+                    missing_search_sidecars = state.missing_search_sidecars,
+                    invalid_search_sidecars = state.invalid_search_sidecars,
+                    rebuilt_search_sidecars = state.rebuilt_search_sidecars,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "processed streaming search query"
+                );
+                if inaccessible_search_sidecars > 0 {
+                    warn!(
+                        inaccessible_search_sidecars,
+                        missing_search_sidecars = state.missing_search_sidecars,
+                        invalid_search_sidecars = state.invalid_search_sidecars,
+                        rebuilt_search_sidecars = state.rebuilt_search_sidecars,
+                        "encountered inaccessible search sidecars during query"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn rebuild_partition_sidecars(&self, path: &Path) -> Result<u64, Box<dyn Error>> {
+        let _sidecar_updates = self.sidecar_updates.acquire_reindex()?;
+        let result = reindex_partition(
+            ReindexJob {
+                path: path.to_path_buf(),
+                file_index: 0,
+            },
+            self.searchable_kinds.as_deref(),
+        )?;
+        self.visibility_store
+            .merge_summary(&result.visibility_summary)
+            .map_err(|err| error_with_path("write visibility index", &self.partitions_dir, err))?;
+        Ok(result.events)
+    }
+
+    fn hot_snapshot(&self) -> Result<(Vec<EventPacket>, SearchIndex), Box<dyn Error>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let hot_packets = read_event_packets(&mut state.file)
+            .map_err(|err| error_with_path("read events", &self.path, err))?;
+        let mut compacting_packets = self.read_compacting_packets()?;
+        if compacting_packets.is_empty() {
+            Ok((hot_packets, state.hot_search_index.clone()))
+        } else {
+            let mut packets = hot_packets;
+            packets.append(&mut compacting_packets);
+            let search_index = build_search_index(&packets, self.searchable_kinds.as_deref())?;
+            Ok((packets, search_index))
+        }
+    }
+
+    pub(crate) fn negentropy_items_for_unix_day(
+        &self,
+        unix_day: u64,
+    ) -> Result<Vec<NegentropyItem>, Box<dyn Error>> {
+        let mut items = Vec::new();
+        for packet in read_event_packets_from_path(&partition_path(&self.partitions_dir, unix_day))?
+        {
+            items.push((packet.created_at, packet.id));
+        }
+        let (hot_packets, _) = self.hot_snapshot()?;
+        for packet in hot_packets {
+            if packet.unix_day() == unix_day {
+                items.push((packet.created_at, packet.id));
+            }
+        }
+        items.sort_unstable();
+        items.dedup_by_key(|(_, id)| *id);
+        Ok(items)
+    }
+
+    pub(crate) fn reindex(
+        &self,
+        force: bool,
+        mut progress: impl FnMut(ReindexProgress),
+    ) -> Result<ReindexStats, Box<dyn Error>> {
+        let mut stats = ReindexStats::default();
+
+        let partition_paths = partition_event_paths(&self.partitions_dir)?;
+        let file_total = partition_paths.len() as u64;
+        let mut reindex_jobs = Vec::new();
+        let mut last_plan_log = Instant::now();
+
+        info!(file_total, force, "checking partition index freshness");
+
+        for (index, path) in partition_paths.iter().enumerate() {
+            let file_index = index as u64 + 1;
+            if file_index == 1 || last_plan_log.elapsed() >= Duration::from_secs(10) {
+                info!(
+                    path = %path.display(),
+                    file_index,
+                    file_total,
+                    "checking partition index freshness"
+                );
+                last_plan_log = Instant::now();
+            }
+
+            if !force && search_sidecar_is_current(path, self.searchable_kinds.as_deref())? {
+                stats.skipped_files += 1;
+                progress(ReindexProgress {
+                    phase: ReindexProgressPhase::Skipped,
+                    path: path.clone(),
+                    file_index,
+                    file_total,
+                    events: 0,
+                });
+                continue;
+            }
+
+            reindex_jobs.push(ReindexJob {
+                path: path.clone(),
+                file_index,
+            });
+        }
+
+        info!(
+            files = reindex_jobs.len(),
+            skipped_files = stats.skipped_files,
+            file_total,
+            "planned partition index updates"
+        );
+
+        for job in reindex_jobs {
+            progress(ReindexProgress {
+                phase: ReindexProgressPhase::Started,
+                path: job.path.clone(),
+                file_index: job.file_index,
+                file_total,
+                events: 0,
+            });
+            let _sidecar_updates = self.sidecar_updates.acquire_reindex()?;
+            let result = reindex_partition(job, self.searchable_kinds.as_deref())?;
+            self.visibility_store
+                .merge_summary(&result.visibility_summary)
+                .map_err(|err| {
+                    error_with_path("write visibility index", &self.partitions_dir, err)
+                })?;
+            stats.files += 1;
+            stats.events += result.events;
+            progress(ReindexProgress {
+                phase: ReindexProgressPhase::Finished,
+                path: result.path,
+                file_index: result.file_index,
+                file_total,
+                events: result.events,
+            });
+        }
+
+        Ok(stats)
+    }
+}
+
+fn acquire_storage_lock(storage_dir: &Path) -> Result<File, Box<dyn Error>> {
+    let lock_path = storage_dir.join(STORAGE_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| error_with_path("open storage lock", &lock_path, err))?;
+    file.try_lock_exclusive()
+        .map_err(|err| error_with_path("lock storage", &lock_path, err))?;
+    Ok(file)
+}

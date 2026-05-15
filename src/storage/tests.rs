@@ -1,7 +1,16 @@
 use super::search::{events_fingerprint, read_search_index};
 use super::*;
+use super::{
+    event::read_event_packets_from_path,
+    hot::HotEvents,
+    partition::{partition_event_paths, partition_path},
+    search::search_index_path,
+    sidecar_queue::SidecarUpdateQueue,
+    visibility::visibility_store_path,
+};
 use crate::nostr::{EventId, Filter, Kind, PublicKey, Timestamp};
 use ndb::NdbNoteBuf;
+use std::fs;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
