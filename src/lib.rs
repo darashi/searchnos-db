@@ -11,7 +11,7 @@ mod storage;
 mod text;
 
 pub use db::{
-    CompactStats, DatabaseStats, DumpProgress, FilterStats, LoadProgress, PurgePolicy,
-    PurgeSpecError, QueryResult, QueryStats, ReindexProgress, ReindexProgressPhase, ReindexStats,
-    SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem, Subscription,
+    CompactStats, DatabaseStats, DumpProgress, FilterStats, InsertOptions, LoadProgress,
+    PurgePolicy, PurgeSpecError, QueryResult, QueryStats, ReindexProgress, ReindexProgressPhase,
+    ReindexStats, SearchnosDB, SearchnosDBError, SearchnosDBOptions, StreamItem, Subscription,
 };

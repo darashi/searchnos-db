@@ -31,6 +31,19 @@ pub struct SearchnosDBOptions {
     pub searchable_kinds: Option<Vec<u32>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOptions {
+    pub notify_subscribers: bool,
+}
+
+impl Default for InsertOptions {
+    fn default() -> Self {
+        Self {
+            notify_subscribers: true,
+        }
+    }
+}
+
 impl Default for SearchnosDBOptions {
     fn default() -> Self {
         Self {
@@ -196,11 +209,19 @@ impl SearchnosDB {
         Ok(subscription)
     }
 
-    pub fn insert_event_json(&self, event_json: &str) -> Result<(), SearchnosDBError> {
-        self.insert_event_json_owned(event_json.to_owned())
+    pub fn insert_event_json(
+        &self,
+        event_json: &str,
+        options: InsertOptions,
+    ) -> Result<(), SearchnosDBError> {
+        self.insert_event_json_owned(event_json.to_owned(), options)
     }
 
-    pub fn insert_event_json_owned(&self, event_json: String) -> Result<(), SearchnosDBError> {
+    pub fn insert_event_json_owned(
+        &self,
+        event_json: String,
+        options: InsertOptions,
+    ) -> Result<(), SearchnosDBError> {
         let note = to_ndb_note_buf(&event_json).map_err(Self::note_json_error_to_db_error)?;
         let note_ref = note.as_ndb_note();
         verify_note(&note_ref).map_err(SearchnosDBError::InvalidSignature)?;
@@ -208,7 +229,9 @@ impl SearchnosDB {
         self.storage
             .append_packet(&bytes)
             .map_err(Self::storage_error)?;
-        self.broadcast_packet(&bytes, &event_json);
+        if options.notify_subscribers {
+            self.broadcast_packet(&bytes, &event_json);
+        }
         Ok(())
     }
 
@@ -597,3 +620,159 @@ impl std::fmt::Display for StopStreaming {
 }
 
 impl Error for StopStreaming {}
+
+#[cfg(test)]
+mod tests {
+    use super::{InsertOptions, SearchnosDB, StreamItem, Subscription};
+    use crate::nostr::{
+        Event, Filter, JsonUtil,
+        test_utils::{EventBuilder, Keys},
+    };
+    use serde_json::to_string as to_json_string;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("searchnos-db-test-{}-{unique}", std::process::id()));
+            fs::create_dir(&path).expect("failed to create temp test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn open_test_db() -> (TestDir, Arc<SearchnosDB>) {
+        let dir = TestDir::new();
+        let db = SearchnosDB::open(dir.path()).expect("failed to open test db");
+        (dir, Arc::new(db))
+    }
+
+    fn subscribe(db: &Arc<SearchnosDB>, filters: &[Filter]) -> Subscription {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        db.clone().subscribe(&json).expect("subscribe failed")
+    }
+
+    fn query(db: &SearchnosDB, filters: &[Filter]) -> Vec<String> {
+        let json = to_json_string(filters).expect("failed to encode filters");
+        db.query(&json).expect("query failed")
+    }
+
+    fn wait_for_next(subscription: &mut Subscription) -> Option<StreamItem> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(item) = subscription.try_next() {
+                return Some(item);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_eose(subscription: &mut Subscription) {
+        match wait_for_next(subscription) {
+            Some(StreamItem::Eose) => {}
+            Some(StreamItem::Event(event)) => {
+                panic!("unexpected snapshot event before EOSE: {event}")
+            }
+            None => panic!("timed out waiting for EOSE"),
+        }
+    }
+
+    fn assert_no_live_item(subscription: &mut Subscription) {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if let Some(item) = subscription.try_next() {
+                panic!("unexpected live subscription item: {item:?}");
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_next_event(subscription: &mut Subscription, expected: &Event) {
+        assert_eq!(
+            wait_for_next(subscription),
+            Some(StreamItem::Event(expected.as_json()))
+        );
+    }
+
+    #[test]
+    fn insert_event_json_can_store_without_live_notification() {
+        let (_dir, db) = open_test_db();
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("backfilled event")
+            .sign_with_keys(&keys)
+            .expect("failed to sign event");
+        let filters = vec![Filter::new().author(keys.public_key())];
+        let mut subscription = subscribe(&db, &filters);
+        wait_for_eose(&mut subscription);
+
+        db.insert_event_json(
+            &event.as_json(),
+            InsertOptions {
+                notify_subscribers: false,
+            },
+        )
+        .expect("insert failed");
+
+        assert_no_live_item(&mut subscription);
+        assert_eq!(query(&db, &filters), vec![event.as_json()]);
+
+        let mut new_subscription = subscribe(&db, &filters);
+        assert_next_event(&mut new_subscription, &event);
+        assert_eq!(wait_for_next(&mut new_subscription), Some(StreamItem::Eose));
+    }
+
+    #[test]
+    fn suppressed_insert_does_not_unregister_non_matching_subscriptions() {
+        let (_dir, db) = open_test_db();
+        let matching_keys = Keys::generate();
+        let other_keys = Keys::generate();
+        let suppressed_event = EventBuilder::text_note("suppressed")
+            .sign_with_keys(&matching_keys)
+            .expect("failed to sign suppressed event");
+        let other_event = EventBuilder::text_note("other")
+            .sign_with_keys(&other_keys)
+            .expect("failed to sign other event");
+        let other_filters = vec![Filter::new().author(other_keys.public_key())];
+        let mut other_subscription = subscribe(&db, &other_filters);
+        wait_for_eose(&mut other_subscription);
+
+        db.insert_event_json(
+            &suppressed_event.as_json(),
+            InsertOptions {
+                notify_subscribers: false,
+            },
+        )
+        .expect("suppressed insert failed");
+        assert_no_live_item(&mut other_subscription);
+
+        db.insert_event_json(&other_event.as_json(), InsertOptions::default())
+            .expect("other insert failed");
+        assert_next_event(&mut other_subscription, &other_event);
+    }
+}

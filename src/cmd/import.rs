@@ -1,5 +1,6 @@
 use crate::cmd::{CliError, default_progress_style, open_database};
 use indicatif::ProgressBar;
+use searchnos_db::InsertOptions;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ pub fn run(db_path: &str, import_paths: &[PathBuf]) -> Result<(), CliError> {
                 continue;
             }
 
-            db.insert_event_json(&line)
+            db.insert_event_json(&line, InsertOptions::default())
                 .map_err(|source| CliError::Import {
                     path: path.to_string_lossy().into_owned(),
                     line: idx + 1,

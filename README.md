@@ -138,12 +138,12 @@ verifies events before inserting them, returns query results as event JSON, and
 provides dump/load helpers.
 
 ```rust
-use searchnos_db::SearchnosDB;
+use searchnos_db::{InsertOptions, SearchnosDB};
 
 let db = SearchnosDB::open("./data")?;
 
 let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":[],"created_at":0,"sig":"..."}"#;
-db.insert_event_json(raw_event)?;
+db.insert_event_json(raw_event, InsertOptions::default())?;
 ```
 
 Maintenance operations are also available from Rust:
