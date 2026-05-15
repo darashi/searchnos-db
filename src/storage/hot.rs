@@ -116,7 +116,6 @@ impl HotEvents {
             deferred_compaction_last_log_unix: AtomicU64::new(0),
         };
         hot_events.recover_compacting_hot_files()?;
-        hot_events.reindex(false, |_| {})?;
         Ok(hot_events)
     }
 
