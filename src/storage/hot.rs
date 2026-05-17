@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,7 @@ pub(crate) struct HotEvents {
     pub(crate) partitions_dir: PathBuf,
     _lock_file: File,
     max_bytes: u64,
+    compact_workers: Option<NonZeroUsize>,
     pub(crate) searchable_kinds: Option<Vec<u32>>,
     pub(crate) visibility_store: Arc<VisibilityStore>,
     state: Arc<Mutex<HotState>>,
@@ -56,9 +58,15 @@ pub(crate) struct HotState {
 impl HotEvents {
     pub(crate) fn open(
         max_bytes: u64,
+        compact_workers: Option<NonZeroUsize>,
         searchable_kinds: Option<&[u32]>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open_at_with_searchable_kinds(DEFAULT_STORAGE_DIR, max_bytes, searchable_kinds)
+        Self::open_at_with_searchable_kinds(
+            DEFAULT_STORAGE_DIR,
+            max_bytes,
+            compact_workers,
+            searchable_kinds,
+        )
     }
 
     #[cfg(test)]
@@ -66,12 +74,13 @@ impl HotEvents {
         storage_dir: impl Into<PathBuf>,
         max_bytes: u64,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open_at_with_searchable_kinds(storage_dir, max_bytes, None)
+        Self::open_at_with_searchable_kinds(storage_dir, max_bytes, None, None)
     }
 
     pub(crate) fn open_at_with_searchable_kinds(
         storage_dir: impl Into<PathBuf>,
         max_bytes: u64,
+        compact_workers: Option<NonZeroUsize>,
         searchable_kinds: Option<&[u32]>,
     ) -> Result<Self, Box<dyn Error>> {
         let storage_dir = storage_dir.into();
@@ -103,6 +112,7 @@ impl HotEvents {
             partitions_dir,
             _lock_file: lock_file,
             max_bytes,
+            compact_workers,
             searchable_kinds,
             visibility_store,
             state: Arc::new(Mutex::new(HotState {
@@ -133,6 +143,7 @@ impl HotEvents {
                 &compact_path,
                 &self.partitions_dir,
                 self.searchable_kinds.as_deref(),
+                self.compact_workers,
                 &self.visibility_store,
                 &self.sidecar_updates,
             )?;
@@ -219,6 +230,7 @@ impl HotEvents {
                 path: self.path.clone(),
                 partitions_dir: self.partitions_dir.clone(),
                 max_bytes: self.max_bytes,
+                compact_workers: self.compact_workers,
                 searchable_kinds: self.searchable_kinds.clone(),
                 visibility_store: self.visibility_store.clone(),
                 state: self.state.clone(),
@@ -288,6 +300,7 @@ impl HotEvents {
                 path: self.path.clone(),
                 partitions_dir: self.partitions_dir.clone(),
                 max_bytes: self.max_bytes,
+                compact_workers: self.compact_workers,
                 searchable_kinds: self.searchable_kinds.clone(),
                 visibility_store: self.visibility_store.clone(),
                 state: self.state.clone(),
@@ -306,6 +319,7 @@ impl HotEvents {
                 path: self.path.clone(),
                 partitions_dir: self.partitions_dir.clone(),
                 max_bytes: self.max_bytes,
+                compact_workers: self.compact_workers,
                 searchable_kinds: self.searchable_kinds.clone(),
                 visibility_store: self.visibility_store.clone(),
                 state: self.state.clone(),
@@ -328,6 +342,7 @@ impl HotEvents {
             path: self.path.clone(),
             partitions_dir: self.partitions_dir.clone(),
             max_bytes: self.max_bytes,
+            compact_workers: self.compact_workers,
             searchable_kinds: self.searchable_kinds.clone(),
             visibility_store: self.visibility_store.clone(),
             state: self.state.clone(),

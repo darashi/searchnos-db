@@ -146,6 +146,22 @@ let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":
 db.insert_event_json(raw_event, InsertOptions::default())?;
 ```
 
+Configure automatic compaction workers with `SearchnosDBOptions` when opening a
+database:
+
+```rust
+use std::num::NonZeroUsize;
+use searchnos_db::{SearchnosDB, SearchnosDBOptions};
+
+let db = SearchnosDB::open_with_options(
+    "./data",
+    SearchnosDBOptions {
+        compact_workers: NonZeroUsize::new(4),
+        ..SearchnosDBOptions::default()
+    },
+)?;
+```
+
 Maintenance operations are also available from Rust:
 
 ```rust

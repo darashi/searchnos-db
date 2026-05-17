@@ -5,6 +5,7 @@ use crate::storage::{DEFAULT_HOT_MAX_BYTES, Storage};
 use serde_json::{Map, Value};
 use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,8 @@ pub struct SearchnosDBOptions {
     pub default_limit: Option<usize>,
     pub max_limit: Option<usize>,
     pub hot_max_bytes: u64,
+    /// None uses available CPU parallelism, capped by the number of output partitions.
+    pub compact_workers: Option<NonZeroUsize>,
     /// None means all event kinds are searchable.
     pub searchable_kinds: Option<Vec<u32>>,
 }
@@ -54,6 +57,7 @@ impl Default for SearchnosDBOptions {
             default_limit: None,
             max_limit: None,
             hot_max_bytes: DEFAULT_HOT_MAX_BYTES,
+            compact_workers: None,
             searchable_kinds: None,
         }
     }
@@ -153,6 +157,7 @@ impl SearchnosDB {
         let storage = Storage::open_at_with_searchable_kinds(
             root,
             options.hot_max_bytes,
+            options.compact_workers,
             options.searchable_kinds.as_deref(),
         )
         .map_err(Self::storage_error)?;

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ pub(crate) struct CompactionContext {
     pub(crate) path: PathBuf,
     pub(crate) partitions_dir: PathBuf,
     pub(crate) max_bytes: u64,
+    pub(crate) compact_workers: Option<NonZeroUsize>,
     pub(crate) searchable_kinds: Option<Vec<u32>>,
     pub(crate) visibility_store: Arc<VisibilityStore>,
     pub(crate) state: Arc<Mutex<HotState>>,
@@ -129,6 +131,7 @@ pub(crate) fn run_one_compaction(
         &context.compact_path,
         &context.partitions_dir,
         context.searchable_kinds.as_deref(),
+        context.compact_workers,
         &context.visibility_store,
         &context.sidecar_updates,
     ) {
@@ -211,6 +214,7 @@ pub(crate) fn compact_hot_file(
     compact_path: &Path,
     partitions_dir: &Path,
     searchable_kinds: Option<&[u32]>,
+    compact_workers: Option<NonZeroUsize>,
     visibility_store: &VisibilityStore,
     sidecar_updates: &SidecarUpdateQueue,
 ) -> Result<CompactOutput, Box<dyn Error>> {
@@ -228,10 +232,7 @@ pub(crate) fn compact_hot_file(
     let _sidecar_updates = sidecar_updates.acquire_compaction()?;
     let jobs = Mutex::new(packets_by_day.into_iter());
     thread::scope(|scope| {
-        let worker_count = thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .min(output_partitions);
+        let worker_count = compaction_worker_count(output_partitions, compact_workers);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let jobs = &jobs;
@@ -270,6 +271,20 @@ pub(crate) fn compact_hot_file(
         output_partitions,
         events,
     })
+}
+
+fn compaction_worker_count(
+    output_partitions: usize,
+    compact_workers: Option<NonZeroUsize>,
+) -> usize {
+    compact_workers
+        .map(usize::from)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+        .min(output_partitions)
 }
 
 fn merge_packets_into_partition(
@@ -346,6 +361,23 @@ fn merge_packets_into_partition(
     fs::rename(&tmp_search_path, search_path)?;
     visibility_store.merge_summary(&visibility_summary)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_worker_count;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn configured_compaction_workers_are_capped_by_output_partitions() {
+        assert_eq!(compaction_worker_count(3, NonZeroUsize::new(8)), 3);
+        assert_eq!(compaction_worker_count(8, NonZeroUsize::new(3)), 3);
+    }
+
+    #[test]
+    fn compaction_uses_no_workers_when_there_are_no_partitions() {
+        assert_eq!(compaction_worker_count(0, NonZeroUsize::new(3)), 0);
+    }
 }
 
 fn write_merged_packet(

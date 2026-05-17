@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use crate::nostr::Filter;
@@ -39,10 +40,11 @@ pub struct Storage {
 impl Storage {
     pub fn open(
         hot_max_bytes: u64,
+        compact_workers: Option<NonZeroUsize>,
         searchable_kinds: Option<&[u32]>,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            hot_events: HotEvents::open(hot_max_bytes, searchable_kinds)?,
+            hot_events: HotEvents::open(hot_max_bytes, compact_workers, searchable_kinds)?,
         })
     }
 
@@ -107,18 +109,20 @@ impl Storage {
         storage_dir: impl Into<PathBuf>,
         hot_max_bytes: u64,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::open_at_with_searchable_kinds(storage_dir, hot_max_bytes, None)
+        Self::open_at_with_searchable_kinds(storage_dir, hot_max_bytes, None, None)
     }
 
     pub fn open_at_with_searchable_kinds(
         storage_dir: impl Into<PathBuf>,
         hot_max_bytes: u64,
+        compact_workers: Option<NonZeroUsize>,
         searchable_kinds: Option<&[u32]>,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             hot_events: HotEvents::open_at_with_searchable_kinds(
                 storage_dir,
                 hot_max_bytes,
+                compact_workers,
                 searchable_kinds,
             )?,
         })

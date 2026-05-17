@@ -665,7 +665,7 @@ fn query_search_indexes_all_kinds_by_default() {
 #[test]
 fn query_search_indexes_no_kinds_when_explicitly_empty() {
     let dir = test_dir("query-search-no-kinds");
-    let storage = Storage::open_at_with_searchable_kinds(&dir, 1000, Some(&[])).unwrap();
+    let storage = Storage::open_at_with_searchable_kinds(&dir, 1000, None, Some(&[])).unwrap();
 
     storage
         .append_packet(&note_with("00", "aa", 10, 1, "[]", "delete target"))
@@ -685,7 +685,7 @@ fn reindex_rebuilds_sidecar_when_searchable_kinds_change() {
     let kind2 = note_with("11", "aa", SECONDS_PER_DAY + 20, 2, "[]", "target text");
 
     {
-        let storage = Storage::open_at_with_searchable_kinds(&dir, 1, Some(&[1])).unwrap();
+        let storage = Storage::open_at_with_searchable_kinds(&dir, 1, None, Some(&[1])).unwrap();
         storage.append_packet(&kind1).unwrap();
         storage.append_packet(&kind2).unwrap();
 
@@ -695,7 +695,7 @@ fn reindex_rebuilds_sidecar_when_searchable_kinds_change() {
         );
     }
 
-    let storage = Storage::open_at_with_searchable_kinds(&dir, 1, Some(&[2])).unwrap();
+    let storage = Storage::open_at_with_searchable_kinds(&dir, 1, None, Some(&[2])).unwrap();
 
     assert_eq!(
         storage.query(&[Filter::new().search("target")]).unwrap(),
