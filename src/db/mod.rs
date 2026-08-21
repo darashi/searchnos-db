@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod purge_policy;
+mod snapshot_batch;
 mod subscription;
 
 pub use purge_policy::{PurgePolicy, PurgeSpecError};
@@ -64,8 +65,9 @@ impl Default for SearchnosDBOptions {
 }
 
 pub struct SearchnosDB {
-    storage: Storage,
+    storage: Arc<Storage>,
     subscriptions: subscription::SubscriptionManager,
+    snapshot_batcher: snapshot_batch::SnapshotBatcher,
     default_limit: Option<usize>,
     max_limit: Option<usize>,
 }
@@ -92,6 +94,8 @@ pub enum SearchnosDBError {
     EventPayloadTooLarge(usize),
     #[error("batch state is poisoned")]
     BatchStatePoisoned,
+    #[error("subscription snapshot batch worker stopped")]
+    SnapshotBatchWorkerStopped,
 }
 
 #[derive(Debug, Clone)]
@@ -154,17 +158,23 @@ impl SearchnosDB {
         options: SearchnosDBOptions,
     ) -> Result<Self, SearchnosDBError> {
         let root = path.as_ref();
-        let storage = Storage::open_at_with_searchable_kinds(
-            root,
-            options.hot_max_bytes,
-            options.compact_workers,
-            options.searchable_kinds.as_deref(),
-        )
-        .map_err(Self::storage_error)?;
+        let storage = Arc::new(
+            Storage::open_at_with_searchable_kinds(
+                root,
+                options.hot_max_bytes,
+                options.compact_workers,
+                options.searchable_kinds.as_deref(),
+            )
+            .map_err(Self::storage_error)?,
+        );
+        let subscriptions = subscription::SubscriptionManager::new(options.subscription_capacity);
+        let snapshot_batcher =
+            snapshot_batch::SnapshotBatcher::start(storage.clone(), subscriptions.clone());
 
         Ok(Self {
             storage,
-            subscriptions: subscription::SubscriptionManager::new(options.subscription_capacity),
+            subscriptions,
+            snapshot_batcher,
             default_limit: options.default_limit,
             max_limit: options.max_limit,
         })
@@ -175,41 +185,22 @@ impl SearchnosDB {
         filters_json: &str,
     ) -> Result<subscription::Subscription, SearchnosDBError> {
         let filters = self.normalized_storage_filters_from_json(filters_json)?;
+        let snapshot_filters = filters.clone();
         let (id, receiver, sender) = self.subscriptions.register(filters);
         let subscription =
             subscription::Subscription::new(id, receiver, self.subscriptions.clone());
-        let filters_json = filters_json.to_owned();
-        let db = self.clone();
-
-        std::thread::spawn(move || {
-            let mut receiver_open = true;
-            let result = db.stream_query(&filters_json, |event_json| {
-                if sender
-                    .blocking_send(subscription::StreamItem::Event(event_json))
-                    .is_err()
-                {
-                    receiver_open = false;
-                    return false;
-                }
-                true
-            });
-
-            match result {
-                Ok(()) if receiver_open => {
-                    if sender
-                        .blocking_send(subscription::StreamItem::Eose)
-                        .is_err()
-                    {
-                        db.subscriptions.unregister(id);
-                    }
-                }
-                Ok(()) => db.subscriptions.unregister(id),
-                Err(err) => {
-                    db.subscriptions.unregister(id);
-                    eprintln!("failed to stream subscription snapshot: {err}");
-                }
-            }
-        });
+        if self
+            .snapshot_batcher
+            .enqueue(snapshot_batch::SnapshotRequest {
+                id,
+                filters: snapshot_filters,
+                sender,
+            })
+            .is_err()
+        {
+            self.subscriptions.unregister(id);
+            return Err(SearchnosDBError::SnapshotBatchWorkerStopped);
+        }
 
         Ok(subscription)
     }
@@ -630,7 +621,7 @@ impl Error for StopStreaming {}
 mod tests {
     use super::{InsertOptions, SearchnosDB, StreamItem, Subscription};
     use crate::nostr::{
-        Event, Filter, JsonUtil,
+        Event, Filter, JsonUtil, Timestamp,
         test_utils::{EventBuilder, Keys},
     };
     use serde_json::to_string as to_json_string;
@@ -723,6 +714,65 @@ mod tests {
             wait_for_next(subscription),
             Some(StreamItem::Event(expected.as_json()))
         );
+    }
+
+    fn snapshot_events(subscription: &mut Subscription) -> Vec<String> {
+        let mut events = Vec::new();
+        loop {
+            match wait_for_next(subscription) {
+                Some(StreamItem::Event(event)) => events.push(event),
+                Some(StreamItem::Eose) => return events,
+                None => panic!("timed out waiting for snapshot EOSE"),
+            }
+        }
+    }
+
+    #[test]
+    fn subscriptions_batch_distinct_search_terms_and_continue_with_live_events() {
+        let (_dir, db) = open_test_db();
+        let keys = Keys::generate();
+        let rust = EventBuilder::text_note("rust language")
+            .custom_created_at(Timestamp::from_secs(10))
+            .sign_with_keys(&keys)
+            .expect("failed to sign rust event");
+        let nostr = EventBuilder::text_note("nostr relay")
+            .custom_created_at(Timestamp::from_secs(20))
+            .sign_with_keys(&keys)
+            .expect("failed to sign nostr event");
+        let both = EventBuilder::text_note("rust nostr")
+            .custom_created_at(Timestamp::from_secs(30))
+            .sign_with_keys(&keys)
+            .expect("failed to sign combined event");
+        for event in [&rust, &nostr, &both] {
+            db.insert_event_json(
+                &event.as_json(),
+                InsertOptions {
+                    notify_subscribers: false,
+                },
+            )
+            .expect("insert failed");
+        }
+
+        let mut rust_subscription = subscribe(&db, &[Filter::new().search("rust")]);
+        let mut nostr_subscription = subscribe(&db, &[Filter::new().search("nostr")]);
+
+        assert_eq!(
+            snapshot_events(&mut rust_subscription),
+            vec![both.as_json(), rust.as_json()]
+        );
+        assert_eq!(
+            snapshot_events(&mut nostr_subscription),
+            vec![both.as_json(), nostr.as_json()]
+        );
+
+        let live = EventBuilder::text_note("new rust event")
+            .custom_created_at(Timestamp::from_secs(40))
+            .sign_with_keys(&keys)
+            .expect("failed to sign live event");
+        db.insert_event_json(&live.as_json(), InsertOptions::default())
+            .expect("live insert failed");
+        assert_next_event(&mut rust_subscription, &live);
+        assert_no_live_item(&mut nostr_subscription);
     }
 
     #[test]

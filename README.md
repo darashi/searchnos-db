@@ -190,6 +190,15 @@ db.stream_query(r#"{"limit":100}"#, |event_json| {
 
 Return `false` from the callback to stop delivery early.
 
+### Subscriptions
+
+Initial snapshots created by `subscribe` are handled by one shared worker. The
+worker coalesces subscriptions received within 10 milliseconds and scans each
+daily search index once for the whole batch, including subscriptions with
+different search terms. Results retain each subscription's filter order,
+per-filter limits, event deduplication, and newest-first ordering. After `EOSE`,
+matching events continue through the live subscription path.
+
 ## Development Workflow
 
 Run the following checks before sending changes:

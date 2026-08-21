@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::nostr::Filter;
 
+mod batched_query;
 mod compaction;
 mod cursor;
 mod event;
@@ -72,6 +73,18 @@ impl Storage {
     ) -> Result<(), Box<dyn Error>> {
         self.hot_events
             .query_streaming(filters, |packet| emit(packet.data))
+    }
+
+    pub(crate) fn query_streaming_batch(
+        &self,
+        queries: &[&[Filter]],
+        is_query_active: impl FnMut(usize) -> bool,
+        mut emit: impl FnMut(Vec<u8>, &[usize]) -> Result<Vec<usize>, Box<dyn Error>>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.hot_events
+            .query_streaming_batch(queries, is_query_active, |packet, query_indexes| {
+                emit(packet.data, query_indexes)
+            })
     }
 
     pub fn packet_matches_filter(

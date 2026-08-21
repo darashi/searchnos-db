@@ -10,7 +10,8 @@ use super::{
 };
 use crate::nostr::{EventId, Filter, Kind, PublicKey, Timestamp};
 use ndb::NdbNoteBuf;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -326,6 +327,131 @@ fn query_applies_limit_per_filter_before_or_deduplication() {
     ];
 
     assert_eq!(storage.query(&filters).unwrap(), vec![overlap, kind_only]);
+}
+
+#[test]
+fn batched_query_matches_independent_queries_across_search_terms_and_filters() {
+    let dir = test_dir("batched-query");
+    let storage = Storage::open_at(&dir, 1).unwrap();
+
+    let newest_both = note_with("00", "aa", 2 * SECONDS_PER_DAY + 30, 1, "[]", "rust nostr");
+    let rust_only = note_with(
+        "11",
+        "aa",
+        2 * SECONDS_PER_DAY + 20,
+        1,
+        "[]",
+        "rust language",
+    );
+    let nostr_only = note_with("22", "bb", 2 * SECONDS_PER_DAY + 10, 2, "[]", "nostr relay");
+    let older_both = note_with(
+        "33",
+        "bb",
+        SECONDS_PER_DAY + 10,
+        2,
+        "[]",
+        "rust nostr archive",
+    );
+    for event in [&older_both, &nostr_only, &rust_only, &newest_both] {
+        storage.append_packet(event).unwrap();
+    }
+
+    let queries = [
+        vec![
+            Filter::new().kind(Kind::from(1u16)).search("rust").limit(1),
+            Filter::new()
+                .kind(Kind::from(2u16))
+                .search("nostr")
+                .limit(2),
+        ],
+        vec![Filter::new().search("nostr").limit(2)],
+        vec![Filter::new().search("language rust").limit(5)],
+        vec![Filter::new().kind(Kind::from(2u16)).limit(1)],
+    ];
+    let expected = queries
+        .iter()
+        .map(|filters| storage.query(filters).unwrap())
+        .collect::<Vec<_>>();
+    let query_slices = queries.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut actual = vec![Vec::new(); queries.len()];
+
+    storage
+        .query_streaming_batch(
+            &query_slices,
+            |_| true,
+            |packet, query_indexes| {
+                for query_index in query_indexes {
+                    actual[*query_index].push(packet.clone());
+                }
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn batched_query_stops_inactive_query_without_affecting_others() {
+    let dir = test_dir("batched-query-inactive");
+    let storage = Storage::open_at(&dir, 1).unwrap();
+    let event = note_with("00", "aa", 10, 1, "[]", "rust nostr");
+    storage.append_packet(&event).unwrap();
+    let queries = [
+        vec![Filter::new().search("rust")],
+        vec![Filter::new().search("nostr")],
+    ];
+    let query_slices = queries.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut actual = vec![Vec::new(); queries.len()];
+
+    storage
+        .query_streaming_batch(
+            &query_slices,
+            |query_index| query_index == 0,
+            |packet, query_indexes| {
+                for query_index in query_indexes {
+                    actual[*query_index].push(packet.clone());
+                }
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(actual, vec![vec![event], Vec::new()]);
+}
+
+#[test]
+fn batched_query_stops_partition_scan_when_limits_are_satisfied() {
+    let dir = test_dir("batched-query-limit-stop");
+    let storage = Storage::open_at(&dir, 1).unwrap();
+    let newest = note_with("00", "aa", 20, 1, "[]", "target newest");
+    let older = note_with("11", "aa", 10, 1, "[]", "target older");
+    storage.append_packet(&older).unwrap();
+    storage.append_packet(&newest).unwrap();
+
+    let partition_path = partition_path(&dir.join("partitions"), 0);
+    let second_packet_offset = size_of::<u32>() + newest.len();
+    let mut partition = OpenOptions::new().write(true).open(partition_path).unwrap();
+    partition
+        .seek(SeekFrom::Start(second_packet_offset as u64))
+        .unwrap();
+    partition.write_all(&u32::MAX.to_le_bytes()).unwrap();
+    drop(partition);
+
+    let filters = [Filter::new().search("target").limit(1)];
+    let mut actual = Vec::new();
+    storage
+        .query_streaming_batch(
+            &[&filters],
+            |_| true,
+            |packet, _| {
+                actual.push(packet);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(actual, vec![newest]);
 }
 
 #[test]
@@ -871,6 +997,40 @@ fn query_rebuilds_partition_when_search_sidecar_is_missing() {
             .unwrap(),
         vec![partitioned]
     );
+}
+
+#[test]
+fn batched_query_rebuilds_partition_when_search_sidecar_is_missing() {
+    let dir = test_dir("batched-query-missing-search-sidecar");
+    let partitions_dir = dir.join("partitions");
+    let storage = Storage::open_at(&dir, 1).unwrap();
+    let partitioned = note_with(
+        "00",
+        "aa",
+        SECONDS_PER_DAY + 10,
+        1,
+        "[]",
+        "missing sidecar searchable",
+    );
+    storage.append_packet(&partitioned).unwrap();
+    let search_path = search_index_path(&partition_path(&partitions_dir, 1));
+    fs::remove_file(&search_path).unwrap();
+    let filters = [Filter::new().search("searchable")];
+    let mut actual = Vec::new();
+
+    storage
+        .query_streaming_batch(
+            &[&filters],
+            |_| true,
+            |packet, _| {
+                actual.push(packet);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(actual, vec![partitioned]);
+    assert!(search_path.exists());
 }
 
 #[test]

@@ -43,7 +43,7 @@ pub(crate) fn partition_days(
     Ok(days)
 }
 
-fn partition_day_overlaps_filter(unix_day: u64, filter: &Filter) -> bool {
+pub(crate) fn partition_day_overlaps_filter(unix_day: u64, filter: &Filter) -> bool {
     let day_start = unix_day.saturating_mul(SECONDS_PER_DAY);
     let day_end = day_start.saturating_add(SECONDS_PER_DAY - 1);
     let since = filter.since.map_or(0, |timestamp| timestamp.as_u64());

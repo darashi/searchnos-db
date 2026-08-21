@@ -38,10 +38,14 @@ impl SearchIndex {
         self.records.len()
     }
 
-    pub(crate) fn record_matches_terms(&self, index: usize, terms: &[String]) -> bool {
+    pub(crate) fn record_text(&self, index: usize) -> &[u8] {
         let start = self.offsets.get(index) as usize;
         let end = self.offsets.get(index + 1) as usize;
-        let text = &self.text.as_slice()[start..end];
+        &self.text.as_slice()[start..end]
+    }
+
+    pub(crate) fn record_matches_terms(&self, index: usize, terms: &[String]) -> bool {
+        let text = self.record_text(index);
         terms.iter().all(|term| {
             let term = term.as_bytes();
             text.windows(term.len()).any(|window| window == term)
@@ -416,6 +420,15 @@ fn read_search_index_trusted(
     Ok(index)
 }
 
+pub(crate) fn read_search_bloom_for_events(
+    events_path: &Path,
+    searchable_kinds: Option<&[u32]>,
+) -> Result<SearchBloom, Box<dyn Error>> {
+    let expected_searchable_kinds_hash = text::searchable_kinds_hash(searchable_kinds);
+    let path = search_index_path(events_path);
+    read_search_bloom_trusted(events_path, &path, expected_searchable_kinds_hash)
+}
+
 fn read_search_bloom_trusted(
     events_path: &Path,
     path: &Path,
@@ -659,7 +672,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 }
 
 #[derive(Clone)]
-enum SearchBloom {
+pub(crate) enum SearchBloom {
     Owned(Vec<u8>),
     Mapped { mmap: Arc<Mmap>, offset: usize },
 }
@@ -683,6 +696,17 @@ impl SearchBloom {
             let bit = hash1.wrapping_add(index.wrapping_mul(hash2)) % SEARCH_BLOOM_BITS;
             bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0
         })
+    }
+
+    pub(crate) fn may_match_terms(&self, terms: &[String]) -> bool {
+        terms
+            .iter()
+            .flat_map(|term| {
+                let mut grams = Vec::new();
+                append_search_bloom_grams(term, &mut grams);
+                grams
+            })
+            .all(|gram| self.contains(gram.as_bytes()))
     }
 }
 

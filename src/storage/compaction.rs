@@ -363,6 +363,19 @@ fn merge_packets_into_partition(
     Ok(())
 }
 
+fn write_merged_packet(
+    partition: &mut File,
+    search_index: &mut SearchIndex,
+    visibility_summary: &mut VisibilitySummary,
+    packet: &EventPacket,
+    searchable_kinds: Option<&[u32]>,
+) -> Result<(), Box<dyn Error>> {
+    super::event::write_packet(partition, &packet.data)?;
+    append_to_search_index(search_index, &packet.data, searchable_kinds)?;
+    visibility_summary.add_packet(packet)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::compaction_worker_count;
@@ -378,17 +391,4 @@ mod tests {
     fn compaction_uses_no_workers_when_there_are_no_partitions() {
         assert_eq!(compaction_worker_count(0, NonZeroUsize::new(3)), 0);
     }
-}
-
-fn write_merged_packet(
-    partition: &mut File,
-    search_index: &mut SearchIndex,
-    visibility_summary: &mut VisibilitySummary,
-    packet: &EventPacket,
-    searchable_kinds: Option<&[u32]>,
-) -> Result<(), Box<dyn Error>> {
-    super::event::write_packet(partition, &packet.data)?;
-    append_to_search_index(search_index, &packet.data, searchable_kinds)?;
-    visibility_summary.add_packet(packet)?;
-    Ok(())
 }
