@@ -146,8 +146,8 @@ let raw_event = r#"{"id":"...","pubkey":"...","kind":1,"content":"hello","tags":
 db.insert_event_json(raw_event, InsertOptions::default())?;
 ```
 
-Configure automatic compaction workers with `SearchnosDBOptions` when opening a
-database:
+Configure subscription snapshot and automatic compaction workers with
+`SearchnosDBOptions` when opening a database:
 
 ```rust
 use std::num::NonZeroUsize;
@@ -156,6 +156,7 @@ use searchnos_db::{SearchnosDB, SearchnosDBOptions};
 let db = SearchnosDB::open_with_options(
     "./data",
     SearchnosDBOptions {
+        snapshot_workers: NonZeroUsize::new(4).unwrap(),
         compact_workers: NonZeroUsize::new(4),
         ..SearchnosDBOptions::default()
     },
@@ -192,10 +193,11 @@ Return `false` from the callback to stop delivery early.
 
 ### Subscriptions
 
-Initial snapshots created by `subscribe` are handled by one shared worker. The
-worker coalesces subscriptions received within 10 milliseconds and scans each
-daily search index once for the whole batch, including subscriptions with
-different search terms. Results retain each subscription's filter order,
+Initial snapshots created by `subscribe` start immediately when a snapshot
+worker is idle. When every worker is busy, pending subscriptions are grouped
+into balanced batches and assigned as workers become available. Each worker
+scans a daily search index once for its whole batch, including subscriptions
+with different search terms. Results retain each subscription's filter order,
 per-filter limits, event deduplication, and newest-first ordering. After `EOSE`,
 matching events continue through the live subscription path.
 

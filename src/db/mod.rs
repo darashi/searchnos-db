@@ -29,6 +29,8 @@ pub struct SearchnosDBOptions {
     pub default_limit: Option<usize>,
     pub max_limit: Option<usize>,
     pub hot_max_bytes: u64,
+    /// Maximum number of subscription snapshot batches processed concurrently.
+    pub snapshot_workers: NonZeroUsize,
     /// None uses available CPU parallelism, capped by the number of output partitions.
     pub compact_workers: Option<NonZeroUsize>,
     /// None means all event kinds are searchable.
@@ -58,6 +60,7 @@ impl Default for SearchnosDBOptions {
             default_limit: None,
             max_limit: None,
             hot_max_bytes: DEFAULT_HOT_MAX_BYTES,
+            snapshot_workers: NonZeroUsize::new(1).expect("one is non-zero"),
             compact_workers: None,
             searchable_kinds: None,
         }
@@ -168,8 +171,11 @@ impl SearchnosDB {
             .map_err(Self::storage_error)?,
         );
         let subscriptions = subscription::SubscriptionManager::new(options.subscription_capacity);
-        let snapshot_batcher =
-            snapshot_batch::SnapshotBatcher::start(storage.clone(), subscriptions.clone());
+        let snapshot_batcher = snapshot_batch::SnapshotBatcher::start(
+            storage.clone(),
+            subscriptions.clone(),
+            options.snapshot_workers,
+        );
 
         Ok(Self {
             storage,
@@ -728,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn subscriptions_batch_distinct_search_terms_and_continue_with_live_events() {
+    fn subscriptions_handle_distinct_search_terms_and_continue_with_live_events() {
         let (_dir, db) = open_test_db();
         let keys = Keys::generate();
         let rust = EventBuilder::text_note("rust language")
