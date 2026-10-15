@@ -182,17 +182,26 @@ pub(crate) fn read_event_packets(file: &mut File) -> Result<Vec<EventPacket>, Bo
 
 pub(crate) fn read_event_packet(file: &mut File) -> Result<Option<EventPacket>, Box<dyn Error>> {
     let mut len_bytes = [0; size_of::<u32>()];
-    match file.read_exact(&mut len_bytes) {
+    match file.read_exact(&mut len_bytes[..1]) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err.into()),
     }
+    file.read_exact(&mut len_bytes[1..])?;
 
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    let mut data = vec![0; len];
-    file.read_exact(&mut data)?;
+    let len = u32::from_le_bytes(len_bytes);
+    // A damaged length prefix must not cause an unbounded allocation before reading.
+    let mut data = Vec::with_capacity((len as usize).min(64 * 1024));
+    file.take(u64::from(len)).read_to_end(&mut data)?;
+    if data.len() != len as usize {
+        return Err(
+            io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete event payload").into(),
+        );
+    }
 
-    Ok(Some(EventPacket::from_data(data)?))
+    EventPacket::from_data(data)
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()).into())
 }
 
 pub(crate) fn write_packet(file: &mut File, data: &[u8]) -> io::Result<()> {

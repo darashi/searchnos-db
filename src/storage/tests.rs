@@ -11,7 +11,7 @@ use super::{
 use crate::nostr::{EventId, Filter, Kind, PublicKey, Timestamp};
 use ndb::NdbNoteBuf;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -30,6 +30,119 @@ fn append_packet_keeps_hot_when_under_size_limit() {
     assert_eq!(fs::read(&hot_path).unwrap(), packet(&note));
     assert!(!search_index_path(&hot_path).exists());
     assert_eq!(partition_event_paths(&partitions_dir).unwrap().len(), 0);
+}
+
+#[test]
+fn open_recovers_hot_prefix_and_preserves_the_original_file() {
+    let first = note("00", 10);
+    let later = note("11", 20);
+    let mut invalid_note = later.clone();
+    invalid_note[151] = 150;
+    let partial_packet = packet(&later)[..60].to_vec();
+    let mut partial_then_valid = partial_packet.clone();
+    partial_then_valid.extend_from_slice(&packet(&later));
+    let damaged_suffixes = [
+        vec![1, 2, 3],
+        partial_packet,
+        packet(&invalid_note),
+        u32::MAX.to_le_bytes().to_vec(),
+        partial_then_valid,
+    ];
+
+    for suffix in damaged_suffixes {
+        let dir = test_dir("recover-hot-prefix");
+        fs::create_dir_all(&dir).unwrap();
+        let hot_path = dir.join("hot.events");
+        let mut original = packet(&first);
+        original.extend_from_slice(&suffix);
+        fs::write(&hot_path, &original).unwrap();
+
+        let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+
+        assert_eq!(
+            storage.query(&[Filter::new()]).unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(fs::read(&hot_path).unwrap(), packet(&first));
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+
+        storage.append_packet(&later).unwrap();
+        assert_eq!(fs::read(&hot_path).unwrap(), packets([&first, &later]));
+        drop(storage);
+        let reopened = Storage::open_at(&dir, u64::MAX).unwrap();
+        assert_eq!(
+            reopened.query(&[Filter::new()]).unwrap(),
+            vec![later.clone(), first.clone()]
+        );
+        drop(reopened);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn open_recovers_hot_with_no_valid_records() {
+    let dir = test_dir("recover-empty-hot-prefix");
+    fs::create_dir_all(&dir).unwrap();
+    let hot_path = dir.join("hot.events");
+    fs::write(&hot_path, [1, 2]).unwrap();
+
+    let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+
+    assert!(storage.query(&[Filter::new()]).unwrap().is_empty());
+    assert_eq!(fs::metadata(&hot_path).unwrap().len(), 0);
+    let event = note("00", 10);
+    storage.append_packet(&event).unwrap();
+    assert_eq!(storage.query(&[Filter::new()]).unwrap(), vec![event]);
+    drop(storage);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn invalid_append_does_not_modify_hot_file_or_search_index() {
+    let dir = test_dir("invalid-hot-append");
+    let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+    let first = note("00", 10);
+    storage.append_packet(&first).unwrap();
+    let mut invalid = note("11", 20);
+    invalid[151] = 150;
+
+    assert!(storage.append_packet(&invalid).is_err());
+    assert_eq!(fs::read(dir.join("hot.events")).unwrap(), packet(&first));
+    assert_eq!(storage.query(&[Filter::new()]).unwrap(), vec![first]);
+    drop(storage);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn corrupt_partition_is_not_recovered_as_hot_data() {
+    for suffix in [vec![1, 2], u32::MAX.to_le_bytes().to_vec()] {
+        let dir = test_dir("strict-partition-read");
+        let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+        let path = partition_path(&dir.join("partitions"), 0);
+        let mut original = packet(&note("00", 10));
+        original.extend_from_slice(&suffix);
+        fs::write(&path, &original).unwrap();
+
+        let error = storage.query(&[Filter::new()]).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(storage);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[test]
@@ -68,6 +181,42 @@ fn open_recovers_orphaned_compacting_hot_file() {
         packet(&event)
     );
     assert_eq!(storage.query(&[Filter::new()]).unwrap(), vec![event]);
+}
+
+#[test]
+fn open_recovers_damaged_compacting_hot_file_without_reopening_its_backup() {
+    let dir = test_dir("recover-damaged-compacting");
+    fs::create_dir_all(&dir).unwrap();
+    let compacting_path = dir.join("hot.events.compacting-1-0");
+    let event = note("00", 10);
+    let mut original = packet(&event);
+    original.extend_from_slice(&[1, 2]);
+    fs::write(&compacting_path, &original).unwrap();
+
+    let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+
+    assert_eq!(
+        storage.query(&[Filter::new()]).unwrap(),
+        vec![event.clone()]
+    );
+    assert!(!compacting_path.exists());
+    let backups: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("corrupt-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(&backups[0]).unwrap(), original);
+    drop(storage);
+    let storage = Storage::open_at(&dir, u64::MAX).unwrap();
+    assert_eq!(storage.query(&[Filter::new()]).unwrap(), vec![event]);
+    drop(storage);
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

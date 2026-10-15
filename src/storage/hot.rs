@@ -20,6 +20,7 @@ use super::event::{
     EventPacket, error_with_path, read_event_packets, read_event_packets_from_path,
 };
 use super::partition::{orphaned_compacting_hot_paths, partition_path};
+use super::recovery::recover_hot_events;
 use super::search::{
     SearchIndex, append_to_search_index, build_search_index, remove_file_if_exists,
     search_index_path,
@@ -53,6 +54,31 @@ pub(crate) struct HotEvents {
 pub(crate) struct HotState {
     pub(crate) file: File,
     pub(crate) hot_search_index: SearchIndex,
+    write_failed: bool,
+}
+
+impl HotState {
+    fn append_with_rollback(
+        &mut self,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.write_failed {
+            return Err(io::Error::other(
+                "hot event append rollback failed; reopen storage before writing",
+            ));
+        }
+        let original_len = self.file.metadata()?.len();
+        if let Err(write_error) = write(&mut self.file) {
+            if let Err(rollback_error) = self.file.set_len(original_len) {
+                self.write_failed = true;
+                return Err(io::Error::other(format!(
+                    "hot event append failed: {write_error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(write_error);
+        }
+        Ok(())
+    }
 }
 
 impl HotEvents {
@@ -100,8 +126,7 @@ impl HotEvents {
             .read(true)
             .append(true)
             .open(&path)?;
-        let hot_packets = read_event_packets(&mut file)
-            .map_err(|err| error_with_path("read events", &path, err))?;
+        let hot_packets = recover_hot_events(&mut file, &path)?;
         let hot_search_index = build_search_index(&hot_packets, searchable_kinds.as_deref())
             .map_err(|err| error_with_path("build search index for events", &path, err))?;
         file.seek(SeekFrom::End(0))?;
@@ -118,6 +143,7 @@ impl HotEvents {
             state: Arc::new(Mutex::new(HotState {
                 file,
                 hot_search_index,
+                write_failed: false,
             })),
             sidecar_updates: Arc::new(SidecarUpdateQueue::new()),
             compact_running: Arc::new(AtomicBool::new(false)),
@@ -133,6 +159,11 @@ impl HotEvents {
         let compacting_paths = orphaned_compacting_hot_paths(&self.path)?;
         for compact_path in compacting_paths {
             let started_at = Instant::now();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&compact_path)?;
+            recover_hot_events(&mut file, &compact_path)?;
             let hot_bytes = fs::metadata(&compact_path)?.len();
             info!(
                 path = %compact_path.display(),
@@ -166,12 +197,13 @@ impl HotEvents {
             .state
             .lock()
             .map_err(|err| io::Error::other(err.to_string()))?;
+        ndb::NdbNote::from_bytes(data)?;
         let len = u32::try_from(data.len())?;
         let mut packet = Vec::with_capacity(size_of::<u32>() + data.len());
         packet.extend_from_slice(&len.to_le_bytes());
         packet.extend_from_slice(data);
 
-        state.file.write_all(&packet)?;
+        state.append_with_rollback(|file| file.write_all(&packet))?;
         append_to_search_index(
             &mut state.hot_search_index,
             data,
@@ -438,4 +470,89 @@ fn acquire_storage_lock(storage_dir: &Path) -> Result<File, Box<dyn Error>> {
     file.try_lock_exclusive()
         .map_err(|err| error_with_path("lock storage", &lock_path, err))?;
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::search::empty_search_index;
+
+    fn hot_state() -> (PathBuf, HotState) {
+        let path = std::env::temp_dir().join(format!(
+            "searchnos-append-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        (
+            path,
+            HotState {
+                file,
+                hot_search_index: empty_search_index(None),
+                write_failed: false,
+            },
+        )
+    }
+
+    #[test]
+    fn failed_append_rolls_back_partial_writes_and_allows_retry() {
+        for written_bytes in [0, 1, 3, 4, 60] {
+            let (path, mut state) = hot_state();
+            state.file.write_all(b"existing data").unwrap();
+            let incoming = [42; 100];
+
+            let error = state
+                .append_with_rollback(|file| {
+                    file.write_all(&incoming[..written_bytes])?;
+                    Err(io::Error::new(
+                        io::ErrorKind::StorageFull,
+                        "injected disk full",
+                    ))
+                })
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+            assert_eq!(fs::read(&path).unwrap(), b"existing data");
+            assert_eq!(state.hot_search_index.record_count(), 0);
+            state
+                .append_with_rollback(|file| file.write_all(b"next data"))
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"existing datanext data");
+            drop(state);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_rollback_blocks_later_appends() {
+        let (path, mut state) = hot_state();
+        state.file.write_all(b"existing data").unwrap();
+
+        let error = state
+            .append_with_rollback(|file| {
+                *file = File::open(&path)?;
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected disk full",
+                ))
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("rollback failed"));
+        let error = state
+            .append_with_rollback(|_| panic!("write attempted after failed rollback"))
+            .unwrap_err();
+        assert!(error.to_string().contains("reopen storage"));
+        assert_eq!(fs::read(&path).unwrap(), b"existing data");
+        drop(state);
+        fs::remove_file(path).unwrap();
+    }
 }

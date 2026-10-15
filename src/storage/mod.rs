@@ -13,6 +13,7 @@ mod event;
 mod hot;
 mod partition;
 mod query;
+mod recovery;
 mod reindex;
 mod reindex_runner;
 mod search;

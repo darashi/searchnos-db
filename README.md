@@ -33,6 +33,10 @@ Given `--db-path ./data`, searchnos-db manages files under that directory:
 
 `hot.events` contains newly appended event packets. When the hot file exceeds the configured size, storage rotates and compacts it into per-day partition files under `partitions/`. The `.search` sidecars support search queries, and `visibility/` stores deletion and replaceable-event visibility metadata.
 
+On startup, storage reads `hot.events` up to its first incomplete or invalid record. Before truncating the damaged suffix, it saves the complete original file as `corrupt-<timestamp>-hot.events` and logs the backup path and retained byte and event counts. Records after the first damaged record are not loaded, even if some are intact; the backup preserves them for manual recovery. If the backup cannot be written and synced, opening storage fails without truncating the hot file. The same recovery applies to interrupted `hot.events.compacting-*` files before compaction resumes, with their original names included in the backup names. Partition files remain strict: corrupt partitions cause an error.
+
+Failed hot-file appends roll back to the file's previous length. If rollback also fails, further appends are rejected until storage is reopened.
+
 The `.search` files are derived data that can be rebuilt from their matching `.events` files. Opening storage runs a non-forced reindex, which rebuilds missing, stale, or unreadable sidecars while leaving current sidecars intact. Search queries also repair a missing or unreadable partition sidecar on demand and use the rebuilt sidecar in the same query when repair succeeds. Reindexing writes rebuilt sidecars through a temporary file followed by an atomic rename.
 
 This repository contains the storage source directly under `src/storage/`. Keep storage changes local to that module unless the project intentionally moves back to an external crate.
