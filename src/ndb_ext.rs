@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use ndb::{NdbNote, NdbNoteBuf, TagElement};
-use secp256k1::schnorr::Signature as SchnorrSignature;
-use secp256k1::{Secp256k1, XOnlyPublicKey};
+use secp256k1::XOnlyPublicKey;
+use secp256k1::schnorr::{self, Signature as SchnorrSignature};
 use sha2::{Digest, Sha256};
 
 use crate::nostr::{EventError, Kind};
@@ -103,13 +103,11 @@ pub(crate) fn verify_note(note: &NdbNote<'_>) -> Result<(), EventError> {
         return Err(EventError::InvalidId);
     }
 
-    let secp = Secp256k1::verification_only();
     let pubkey = XOnlyPublicKey::from_byte_array(*note.pubkey())
         .map_err(|_| EventError::InvalidPublicKey)?;
     let signature = SchnorrSignature::from_byte_array(*note.sig());
 
-    secp.verify_schnorr(&signature, &expected_id, &pubkey)
-        .map_err(|_| EventError::InvalidSignature)
+    schnorr::verify(&signature, &expected_id, &pubkey).map_err(|_| EventError::InvalidSignature)
 }
 
 fn compute_note_id(note: &NdbNote<'_>) -> Result<[u8; 32], EventError> {
